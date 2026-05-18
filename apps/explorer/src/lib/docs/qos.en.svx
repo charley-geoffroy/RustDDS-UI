@@ -1,0 +1,151 @@
+# QoS — the matching contract
+
+> **TL;DR**
+> - QoS is a **contract** that the middleware enforces, not a label.
+> - **Each writer and each reader has its own QoS.** The topic only
+>   carries the *default*.
+> - A pair matches when the **writer offers ≥ what the reader requests**.
+>   Stricter is fine; weaker is not.
+> - Mismatches **fail silently** by default.
+
+## The one rule
+
+For each `(writer, reader)` pair sharing a topic, the middleware checks
+each RxO ("Requested vs Offered") policy independently:
+
+> A reader's **requested** QoS must be **satisfied** by a writer's
+> **offered** QoS for the pair to match.
+
+"Satisfied" means stricter-or-equal. A `Reliable` writer satisfies a
+`BestEffort` reader (stricter than asked — fine). A `BestEffort`
+writer does *not* satisfy a `Reliable` reader (weaker than asked —
+mismatch, no data flows).
+
+You can watch this rule run live in the [Interactive workflow
+chapter](#docs/interactive-workflow).
+
+---
+
+## Reliability
+
+| Value | Semantics |
+|---|---|
+| `BestEffort` | Send and forget. Lost packets stay lost. Fast, cheap. |
+| `Reliable` | Acknowledge + retransmit until the reader confirms. |
+
+**Matching matrix:**
+
+| Reader asks ↓ \ Writer offers → | `BestEffort` | `Reliable` |
+|:--|:--:|:--:|
+| `BestEffort` | ✓ | ✓ |
+| `Reliable`   | ✗ | ✓ |
+
+**Pitfall:** ROS 2 defaults to `Reliable` on most user topics. A
+`BestEffort` reader (taken from a tutorial example) will not see
+those — the reverse pitfall of what people expect.
+
+## Durability
+
+Whether late joiners see what was published before they arrived.
+
+| Value | Reader sees |
+|---|---|
+| `Volatile` | Only samples written *after* it joined. |
+| `TransientLocal` | Plus samples still in the writer's local cache (bounded by `History`). |
+| `Transient` | Plus samples kept by a durability service (rarely supported). |
+| `Persistent` | Plus samples that survive reboots (rarely supported). |
+
+**Matching matrix:**
+
+| Reader asks ↓ \ Writer offers → | `Volatile` | `TransientLocal` | `Transient` | `Persistent` |
+|:--|:--:|:--:|:--:|:--:|
+| `Volatile`       | ✓ | ✓ | ✓ | ✓ |
+| `TransientLocal` | ✗ | ✓ | ✓ | ✓ |
+| `Transient`      | ✗ | ✗ | ✓ | ✓ |
+| `Persistent`     | ✗ | ✗ | ✗ | ✓ |
+
+**Pitfall:** "topic exists, no samples" on a Reliable + Volatile pair
+where the writer has nothing to write yet. The first sample written
+*after* the reader appears will be the first one received. To replay
+the writer's history on join, request `TransientLocal` on the reader.
+
+## History (local-only — no matching impact)
+
+How many samples each writer/reader keeps in its own cache.
+
+- `KeepLast(depth)` — caches up to `depth` per instance; older drop.
+- `KeepAll` — caches everything; can block writers if resources are
+  bounded.
+
+Cooperates with Durability: a late `TransientLocal` reader gets up to
+`History.depth` past samples from the writer.
+
+## Deadline
+
+Max time between samples on a topic instance.
+
+**Rule:** writer's deadline ≤ reader's deadline (writer promises to
+write at least as often as the reader requires).
+
+## Liveliness
+
+How the writer signals "I'm alive": `Automatic` (middleware does it),
+`ManualByParticipant` (any write counts), or `ManualByTopic` (app
+must call `assert_liveliness()` per writer).
+
+**Rule:** writer's kind must be stronger or equal; writer's
+`lease_duration` ≤ reader's.
+
+## Ownership
+
+Whether one writer or many can write the same instance:
+`Shared` (all interleaved) or `Exclusive` (highest-strength wins,
+failover on loss).
+
+**Rule:** must match exactly on both sides.
+
+---
+
+## Defaults
+
+The project's backend ships with these:
+
+```rust
+Reliability::Reliable { max_blocking_time: 100ms }
+Durability::Volatile
+History::KeepLast { depth: 100 }
+```
+
+That matches what ROS 2 uses for its default topics, so the
+inspector's subscribers pair with them without further configuration.
+
+---
+
+## Full policy index
+
+| Policy | Affects | RxO\* |
+|---|---|---|
+| Reliability | Delivery guarantee | ✅ |
+| Durability | Late-joiner replay | ✅ |
+| History | Local cache size | ❌ |
+| Deadline | Max sample period | ✅ |
+| Liveliness | Heartbeat semantics | ✅ |
+| Ownership | Exclusive vs shared writers | ✅ |
+| Partition | String-based logical grouping | ❌ |
+| DestinationOrder | Source vs receive timestamp ordering | ✅ |
+| LatencyBudget | Latency hint to the impl | ✅ |
+| TimeBasedFilter | Reader-side throttling | ❌ |
+| Presentation | Coherent / ordered sample sets | ✅ |
+| ResourceLimits | Cap on cache memory | ❌ |
+| Lifespan | TTL on samples in cache | ❌ |
+| TransportPriority | Hint to the impl | ❌ |
+| UserData / TopicData / GroupData | Opaque bytes on endpoints | ❌ |
+| DataRepresentation | XCDR1 / XCDR2 selection | ✅ |
+| TypeConsistencyEnforcement | XTypes strictness | ✅ |
+| WriterDataLifecycle / ReaderDataLifecycle | Auto-dispose | ❌ |
+
+\*RxO = has matching rules. The others are local-only.
+
+> Next chapter — **Endpoints, GUIDs, instances** — decodes the
+> 16-byte identifiers and explains the *instance* concept that
+> Durability and History both rely on.

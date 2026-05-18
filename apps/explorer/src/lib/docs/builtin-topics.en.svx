@@ -1,0 +1,154 @@
+# The 5 builtin topics, in detail
+
+These are the topics every DomainParticipant automatically creates to
+implement discovery and liveliness. The [Discovery
+chapter](#docs/discovery) covered when they're used; this chapter
+covers what's actually inside their samples — so when you click on
+`DCPSParticipant` in the Explorer and look at the hex dump, you can
+read it.
+
+All 5 are **WITH_KEY** topics. Their samples are PL_CDR-encoded
+(parameter-list CDR), which is a self-describing variant: each field
+carries a `ParameterId` (2 bytes) + `length` (2 bytes) + value. Readers
+can skip fields they don't understand, which is what makes RTPS
+extensible.
+
+## DCPSParticipant — SPDP
+
+| Property | Value |
+|---|---|
+| **Type** | `SPDPDiscoveredParticipantData` |
+| **Encoding** | `PL_CDR_LE` (`00 03 ...`) |
+| **QoS** | BestEffort, Volatile, KeepLast(1) |
+| **Transport** | UDP multicast on `239.255.0.1:7400 + 250×domain_id` |
+| **Rate** | Every ~5 s per participant |
+
+Key parameters in the sample:
+
+| ParamId | Name | Type | Notes |
+|---|---|---|---|
+| `0x0015` | `PID_PROTOCOL_VERSION` | 2 bytes | RTPS version (e.g. `02 04` for 2.4) |
+| `0x0016` | `PID_VENDORID` | 2 bytes | The vendor — see the Participants pill |
+| `0x0050` | `PID_PARTICIPANT_GUID` | 16 bytes | The GuidPrefix + entity (always the participant's own GUID) |
+| `0x0032` | `PID_DEFAULT_UNICAST_LOCATOR` | locator | One per network interface |
+| `0x0033` | `PID_DEFAULT_MULTICAST_LOCATOR` | locator | The discovery multicast address |
+| `0x0031` | `PID_METATRAFFIC_UNICAST_LOCATOR` | locator | Where to send unicast SEDP |
+| `0x0002` | `PID_PARTICIPANT_LEASE_DURATION` | 8 bytes | Duration after which the peer counts as gone |
+| `0x0062` | `PID_PARTICIPANT_ENTITY_ID` | 4 bytes | Usually `00 00 01 c1` (the participant) |
+| `0x0058` | `PID_BUILTIN_ENDPOINT_SET` | 4 bytes | Bitmask of which builtin topics this participant participates in |
+| `0x0001` | `PID_USER_DATA` | bytes | Application opaque blob (ROS 2 uses this for node identity) |
+| `0x0062` | `PID_ENTITY_NAME` | string | Human-readable name if any |
+| `0x0001` | `PID_SENTINEL` | (4 zero bytes) | End-of-parameter-list marker |
+
+A locator is encoded as:
+
+```
+┌────────┬────────┬───────────────────────────┐
+│ kind   │ port   │ 16-byte address (IPv4 in last 4 bytes) │
+│ (4)    │ (4)    │                                        │
+└────────┴────────┴───────────────────────────┘
+```
+
+`kind=1` = UDPv4. `kind=2` = UDPv6. The address is IPv6-mapped: an IPv4
+address `192.168.1.42` shows up as `00 00 00 00 00 00 00 00 00 00 00 00
+c0 a8 01 2a`.
+
+## DCPSPublication — SEDP writers
+
+| Property | Value |
+|---|---|
+| **Type** | `DiscoveredWriterData` |
+| **Encoding** | `PL_CDR_LE` |
+| **QoS** | Reliable, TransientLocal, KeepLast(1) |
+| **Transport** | UDP unicast to peers learnt via SPDP |
+| **Rate** | Once per writer creation/deletion |
+
+Key parameters:
+
+| ParamId | Name | Notes |
+|---|---|---|
+| `0x005A` | `PID_ENDPOINT_GUID` | The DataWriter's GUID |
+| `0x005A` | `PID_TOPIC_NAME` | "Chatter" |
+| `0x007 c` | `PID_TYPE_NAME` | "Chatter" or "geometry_msgs::msg::dds_::Twist_" |
+| `0x001A` | `PID_DURABILITY` | enum (Volatile/TransientLocal/…) |
+| `0x001B` | `PID_DURABILITY_SERVICE` | 28 bytes for TL/T config |
+| `0x001D` | `PID_DEADLINE` | 8 bytes (Duration) |
+| `0x001E` | `PID_LATENCY_BUDGET` | 8 bytes |
+| `0x001F` | `PID_LIVELINESS` | enum + lease duration |
+| `0x001A` | `PID_RELIABILITY` | enum + max_blocking_time |
+| `0x0023` | `PID_LIFESPAN` | 8 bytes |
+| `0x0029` | `PID_OWNERSHIP` | enum |
+| `0x0028` | `PID_OWNERSHIP_STRENGTH` | int32 |
+| `0x0040` | `PID_HISTORY` | enum + depth |
+| `0x0041` | `PID_RESOURCE_LIMITS` | 12 bytes |
+
+The QoS values come straight from this payload — that's what the
+**QoS** tab of a topic shows.
+
+## DCPSSubscription — SEDP readers
+
+| Property | Value |
+|---|---|
+| **Type** | `DiscoveredReaderData` |
+| **Encoding** | `PL_CDR_LE` |
+| **QoS** | Reliable, TransientLocal, KeepLast(1) |
+
+Same structure as `DCPSPublication` but the GUID refers to a DataReader
+and a few RX-side fields are added:
+
+- `PID_TIME_BASED_FILTER` (0x0004)
+- `PID_CONTENT_FILTER_PROPERTY` (0x0035) — for content-filtered topics
+- `PID_EXPECTS_INLINE_QOS` (0x0043) — bool
+
+## DCPSTopic — topic-level metadata
+
+| Property | Value |
+|---|---|
+| **Type** | `DiscoveredTopicData` |
+| **Encoding** | `PL_CDR_LE` |
+| **QoS** | Reliable, TransientLocal, KeepLast(1) |
+
+Optional per the spec. A sample is typically published when a topic is
+first declared; per-endpoint announcements on DCPSPublication /
+DCPSSubscription carry the same metadata. Fields:
+
+- `PID_TOPIC_NAME`
+- `PID_TYPE_NAME`
+- Topic-level QoS (a subset of the writer/reader QoS)
+
+## DCPSParticipantMessage — liveliness
+
+| Property | Value |
+|---|---|
+| **Type** | `ParticipantMessageData` |
+| **Encoding** | `CDR_LE` (not PL_CDR — plain payload) |
+| **QoS** | Reliable, TransientLocal, KeepLast(1) |
+| **Rate** | Once per liveliness period (≈ 1 s typical) |
+
+Three fields:
+
+| Offset | Bytes | Field |
+|---|---|---|
+| 0 | 12 | `participant_guid_prefix` |
+| 12 | 4 | `kind` (`AUTOMATIC = 1`, `MANUAL_BY_PARTICIPANT = 2`) |
+| 16 | N | `data` — vendor-specific blob, often empty |
+
+## Inspecting one yourself
+
+If you expand **System** in the sidebar and click `DCPSParticipant`, the
+Samples tab will receive a fresh SPDP every ~5 s (your own participant
+broadcasts to itself). Try this:
+
+1. Click `DCPSParticipant`
+2. Wait for a sample to arrive
+3. The first 4 bytes will be `00 03 00 00` — that's PL_CDR_LE
+4. The next chunk will be a parameter list — each item is
+   `<2-byte ParamId LE> <2-byte length LE> <length bytes value>`
+5. Decode the ones you recognize from the table above
+
+That's the same payload structure all DDS implementations produce — so
+if you point this app at a FastDDS or Cyclone DDS network, the bytes
+look the same (modulo a vendor ID change at parameter 0x0016).
+
+> Next: **ROS 2 on top of DDS** — how the conventions you'll see on a
+> ROS 2 system map onto the DDS concepts we've been describing.

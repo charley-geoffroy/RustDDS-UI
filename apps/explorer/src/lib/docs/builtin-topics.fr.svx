@@ -1,0 +1,157 @@
+# Les 5 topics builtin, en détail
+
+Ce sont les topics que chaque DomainParticipant crée automatiquement
+pour implémenter la discovery et la liveliness. Le [chapitre
+Discovery](#docs/discovery) a couvert quand ils sont utilisés ; ce
+chapitre couvre ce qu'il y a vraiment dans leurs samples — pour que
+quand tu cliques sur `DCPSParticipant` dans l'Explorer et tu regardes
+le hex dump, tu puisses le lire.
+
+Les 5 sont **WITH_KEY**. Leurs samples sont encodés en PL_CDR
+(parameter-list CDR), qui est un variant self-describing : chaque
+champ porte un `ParameterId` (2 bytes) + `length` (2 bytes) + valeur.
+Les readers peuvent skip les champs qu'ils ne comprennent pas, ce qui
+rend RTPS extensible.
+
+## DCPSParticipant — SPDP
+
+| Propriété | Valeur |
+|---|---|
+| **Type** | `SPDPDiscoveredParticipantData` |
+| **Encoding** | `PL_CDR_LE` (`00 03 ...`) |
+| **QoS** | BestEffort, Volatile, KeepLast(1) |
+| **Transport** | UDP multicast sur `239.255.0.1:7400 + 250×domain_id` |
+| **Rate** | Toutes les ~5 s par participant |
+
+Paramètres clés du sample :
+
+| ParamId | Nom | Type | Notes |
+|---|---|---|---|
+| `0x0015` | `PID_PROTOCOL_VERSION` | 2 bytes | Version RTPS (ex. `02 04` pour 2.4) |
+| `0x0016` | `PID_VENDORID` | 2 bytes | Le vendor — voir le pill Participants |
+| `0x0050` | `PID_PARTICIPANT_GUID` | 16 bytes | Le GuidPrefix + entity (toujours le GUID propre du participant) |
+| `0x0032` | `PID_DEFAULT_UNICAST_LOCATOR` | locator | Un par interface réseau |
+| `0x0033` | `PID_DEFAULT_MULTICAST_LOCATOR` | locator | L'adresse multicast de discovery |
+| `0x0031` | `PID_METATRAFFIC_UNICAST_LOCATOR` | locator | Où envoyer le SEDP unicast |
+| `0x0002` | `PID_PARTICIPANT_LEASE_DURATION` | 8 bytes | Duration après laquelle le pair compte comme parti |
+| `0x0062` | `PID_PARTICIPANT_ENTITY_ID` | 4 bytes | D'habitude `00 00 01 c1` (le participant) |
+| `0x0058` | `PID_BUILTIN_ENDPOINT_SET` | 4 bytes | Bitmask de quels topics builtin ce participant participe |
+| `0x0001` | `PID_USER_DATA` | bytes | Blob opaque applicatif (ROS 2 l'utilise pour l'identité de node) |
+| `0x0062` | `PID_ENTITY_NAME` | string | Nom human-readable s'il y en a un |
+| `0x0001` | `PID_SENTINEL` | (4 bytes zéro) | Marqueur fin-de-parameter-list |
+
+Un locator est encodé comme :
+
+```
+┌────────┬────────┬───────────────────────────┐
+│ kind   │ port   │ adresse 16-byte (IPv4 dans les 4 derniers bytes) │
+│ (4)    │ (4)    │                                                  │
+└────────┴────────┴───────────────────────────┘
+```
+
+`kind=1` = UDPv4. `kind=2` = UDPv6. L'adresse est IPv6-mapped : une
+IPv4 `192.168.1.42` apparaît comme `00 00 00 00 00 00 00 00 00 00 00
+00 c0 a8 01 2a`.
+
+## DCPSPublication — writers SEDP
+
+| Propriété | Valeur |
+|---|---|
+| **Type** | `DiscoveredWriterData` |
+| **Encoding** | `PL_CDR_LE` |
+| **QoS** | Reliable, TransientLocal, KeepLast(1) |
+| **Transport** | UDP unicast vers les pairs appris via SPDP |
+| **Rate** | Une fois par création/suppression de writer |
+
+Paramètres clés :
+
+| ParamId | Nom | Notes |
+|---|---|---|
+| `0x005A` | `PID_ENDPOINT_GUID` | Le GUID du DataWriter |
+| `0x005A` | `PID_TOPIC_NAME` | "Chatter" |
+| `0x007 c` | `PID_TYPE_NAME` | "Chatter" ou "geometry_msgs::msg::dds_::Twist_" |
+| `0x001A` | `PID_DURABILITY` | enum (Volatile/TransientLocal/…) |
+| `0x001B` | `PID_DURABILITY_SERVICE` | 28 bytes pour config TL/T |
+| `0x001D` | `PID_DEADLINE` | 8 bytes (Duration) |
+| `0x001E` | `PID_LATENCY_BUDGET` | 8 bytes |
+| `0x001F` | `PID_LIVELINESS` | enum + lease duration |
+| `0x001A` | `PID_RELIABILITY` | enum + max_blocking_time |
+| `0x0023` | `PID_LIFESPAN` | 8 bytes |
+| `0x0029` | `PID_OWNERSHIP` | enum |
+| `0x0028` | `PID_OWNERSHIP_STRENGTH` | int32 |
+| `0x0040` | `PID_HISTORY` | enum + depth |
+| `0x0041` | `PID_RESOURCE_LIMITS` | 12 bytes |
+
+Les valeurs QoS viennent directement de ce payload — c'est ce que
+l'onglet **QoS** d'un topic montre.
+
+## DCPSSubscription — readers SEDP
+
+| Propriété | Valeur |
+|---|---|
+| **Type** | `DiscoveredReaderData` |
+| **Encoding** | `PL_CDR_LE` |
+| **QoS** | Reliable, TransientLocal, KeepLast(1) |
+
+Même structure que `DCPSPublication` mais le GUID réfère à un
+DataReader et quelques champs RX-side sont ajoutés :
+
+- `PID_TIME_BASED_FILTER` (0x0004)
+- `PID_CONTENT_FILTER_PROPERTY` (0x0035) — pour les topics
+  content-filtered
+- `PID_EXPECTS_INLINE_QOS` (0x0043) — bool
+
+## DCPSTopic — metadata topic-level
+
+| Propriété | Valeur |
+|---|---|
+| **Type** | `DiscoveredTopicData` |
+| **Encoding** | `PL_CDR_LE` |
+| **QoS** | Reliable, TransientLocal, KeepLast(1) |
+
+Optionnel selon la spec. Un sample est typiquement publié quand un
+topic est déclaré la première fois ; les annonces per-endpoint sur
+DCPSPublication / DCPSSubscription portent la même metadata. Champs :
+
+- `PID_TOPIC_NAME`
+- `PID_TYPE_NAME`
+- QoS topic-level (un subset de la QoS writer/reader)
+
+## DCPSParticipantMessage — liveliness
+
+| Propriété | Valeur |
+|---|---|
+| **Type** | `ParticipantMessageData` |
+| **Encoding** | `CDR_LE` (pas PL_CDR — payload plain) |
+| **QoS** | Reliable, TransientLocal, KeepLast(1) |
+| **Rate** | Une fois par période de liveliness (≈ 1 s typique) |
+
+Trois champs :
+
+| Offset | Bytes | Champ |
+|---|---|---|
+| 0 | 12 | `participant_guid_prefix` |
+| 12 | 4 | `kind` (`AUTOMATIC = 1`, `MANUAL_BY_PARTICIPANT = 2`) |
+| 16 | N | `data` — blob vendor-specific, souvent vide |
+
+## Inspecter un toi-même
+
+Si tu étends **System** dans la sidebar et cliques `DCPSParticipant`,
+l'onglet Samples recevra un fresh SPDP toutes les ~5 s (ton propre
+participant diffuse vers lui-même). Essaie ça :
+
+1. Click `DCPSParticipant`
+2. Attends qu'un sample arrive
+3. Les 4 premiers bytes seront `00 03 00 00` — c'est PL_CDR_LE
+4. Le chunk suivant sera une parameter list — chaque item est
+   `<2-byte ParamId LE> <2-byte length LE> <length bytes valeur>`
+5. Décode ceux que tu reconnais dans la table ci-dessus
+
+C'est la même structure de payload que toutes les implémentations DDS
+produisent — donc si tu pointes cette app sur un réseau FastDDS ou
+Cyclone DDS, les bytes ressemblent pareil (modulo un changement de
+vendor id au paramètre 0x0016).
+
+> Prochain : **ROS 2 au-dessus de DDS** — comment les conventions que
+> tu verras sur un système ROS 2 mappent sur les concepts DDS qu'on
+> a décrits.

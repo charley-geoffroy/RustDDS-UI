@@ -1,0 +1,40 @@
+# Bienvenue dans RustDDS_UI
+
+Un inspecteur open-source pour les réseaux DDS. L'app repose sur un
+backend DDS pluggable ([RustDDS][1] aujourd'hui, autres prévus dans la
+[roadmap](#docs/backends)) et te permet d'observer un bus DDS : quels
+participants sont présents, ce qu'ils publient, et ce que contiennent
+les bytes sur le fil.
+
+[1]: https://github.com/Atostek/RustDDS
+
+## Ce qu'il y a dans l'app
+
+- **État live** du domaine DDS joint : participants, topics, writers,
+  readers, et les topics builtin de discovery.
+- **Samples bruts** qui passent sur n'importe quel topic, en hex ou
+  ASCII, throttlés à 30 Hz.
+- **Cette documentation** couvrant le protocole DDS, côte à côte
+  avec les vues de l'app.
+
+## Visite rapide
+
+| Élément | Ce qu'il montre |
+|---|---|
+| **Topbar** | Domain ID, version, toggle Explorer/Docs. |
+| **Sidebar → User topics** | Topics créés par les applications utilisateur. |
+| **Sidebar → System** *(replié)* | Les 5 topics builtin de discovery. |
+| **Sidebar → Participants** | Chaque DomainParticipant entendu via SPDP. |
+| **Topic detail** | Quatre onglets — Samples, QoS, Endpoints, Type. |
+
+Appuie sur `/` pour focus la recherche, `Esc` pour fermer le détail
+du topic.
+
+## Ordre de lecture suggéré
+
+- **Aucune base DDS** : **DDS, c'est quoi ?** → **Les objets DDS** →
+  **Workflow interactif**.
+- **Tu connais DDS, tu veux le mapper sur l'app** : **Discovery** →
+  **Endpoints, GUIDs, instances**.
+- **Décoder un hex dump de l'onglet Samples** :
+  **Sérialisation — du hex au texte**.

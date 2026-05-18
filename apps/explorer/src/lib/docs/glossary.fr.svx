@@ -1,0 +1,188 @@
+# Glossaire
+
+Définitions courtes pour chaque terme qui apparaît dans ces docs. La
+plupart des entrées renvoient au chapitre où elles sont expliquées en
+profondeur.
+
+### Backend
+Le nom dans ce projet d'une implémentation DDS interchangeable. Voir
+[Backends](#docs/backends).
+
+### BestEffort
+Une valeur QoS [Reliability](#docs/qos) : envoie une fois, pas de
+retransmission, pas d'ack. Rapide et lossy.
+
+### CDR
+**Common Data Representation** — le format wire standardisé par l'OMG
+pour les payloads DDS. Voir [Sérialisation](#docs/cdr).
+
+### DataReader / DataWriter
+Les objets qui envoient et reçoivent effectivement les samples sur un
+topic. Voir [Les objets DDS](#docs/dds-objects).
+
+### DCPSParticipant, DCPSPublication, DCPSSubscription, DCPSTopic, DCPSParticipantMessage
+Les cinq **topics builtin** que chaque DomainParticipant maintient
+pour la discovery et la liveliness. Voir [Les 5 topics builtin, en
+détail](#docs/builtin-topics).
+
+### Deadline
+Policy QoS spécifiant le temps max entre samples sur une instance
+de topic.
+
+### Discovery
+Le processus de participants se trouvant entre eux et échangeant des
+infos d'endpoint sans configuration. Voir [Discovery](#docs/discovery).
+
+### Domain
+Un bus logique numéroté. Deux participants sur le même domain peuvent
+matcher leurs writers et readers ; des domains différents sont
+invisibles l'un pour l'autre.
+
+### DomainParticipant
+L'objet DDS racine représentant l'appartenance d'un processus à un
+domain.
+
+### Durability
+Une policy [QoS](#docs/qos) : si les late joiners reçoivent les
+samples écrits avant leur arrivée.
+
+### EntityId
+Les 4 derniers bytes d'un [GUID](#docs/endpoints) identifiant un
+writer / reader spécifique au sein d'un participant.
+
+### GuidPrefix
+Les 12 premiers bytes d'un [GUID](#docs/endpoints), partagés par
+toutes les entités du même DomainParticipant.
+
+### GUID
+**Globally Unique Identifier** — 16 bytes qui nomment uniquement
+n'importe quel endpoint DDS sur le bus. Voir [Endpoints, GUIDs,
+instances](#docs/endpoints).
+
+### HDDS
+Une implémentation DDS pure Rust par hdds-team. Voir
+[Backends](#docs/backends).
+
+### History
+QoS local-only bornant combien de samples chaque writer/reader garde
+dans son cache.
+
+### Instance
+Un sous-flux au sein d'un topic WITH_KEY, distingué par la valeur de
+la clé. Voir [Endpoints, GUIDs, instances](#docs/endpoints).
+
+### Key (clé)
+Un champ (ou groupe de champs) sur le type de payload d'un topic
+WITH_KEY utilisé pour identifier à quelle instance un sample
+appartient.
+
+### Liveliness
+Combo policy QoS + status event pour "le writer est-il toujours
+vivant ?". Voir [QoS](#docs/qos).
+
+### Locator
+Un triplet `(transport, port, adresse)` annoncé en SPDP décrivant
+comment joindre un participant en unicast.
+
+### Matching
+L'étape middleware où un writer local et un reader distant (ou
+vice-versa) confirment topic + compat QoS et démarrent l'échange de
+données.
+
+### Multicast
+Transport UDP one-to-many, utilisé par SPDP pour les annonces de
+bootstrap.
+
+### NO_KEY
+Un kind de topic où tout le topic est un seul flux de samples (pas de
+partitionnement en instances).
+
+### OMG
+**Object Management Group** — l'organe de standardisation qui publie
+les specs DDS, RTPS, CDR, XTypes, et DDS-Security.
+
+### Ownership
+Policy QoS : si un seul writer ou plusieurs peuvent écrire sur la
+même instance.
+
+### Participant
+Raccourci pour [DomainParticipant](#docs/dds-objects).
+
+### PL_CDR
+**Parameter-List CDR** — un variant self-describing de CDR utilisé
+par les payloads de discovery. Chaque champ porte son propre ID et
+longueur, donc les readers peuvent skip les champs inconnus.
+
+### Publisher / Subscriber
+Objets DDS qui possèdent des DataWriters / DataReaders et tiennent la
+QoS par défaut. Mostly invisibles en pratique.
+
+### QoS
+**Quality of Service** — le contrat typé attaché aux writers et
+readers. Voir [QoS — le contrat de matching](#docs/qos).
+
+### Reliability
+Policy [QoS](#docs/qos) : BestEffort ou Reliable.
+
+### RepresentationIdentifier
+Le header de 2 bytes au début de chaque payload CDR, disant aux
+décodeurs quel variant CDR suit. Voir [Sérialisation](#docs/cdr).
+
+### rmw
+ROS Middleware abstraction layer — l'équivalent ROS 2 du trait
+`DdsBackend` de ce projet. Voir [ROS 2 au-dessus de DDS](#docs/ros2).
+
+### ROS 2
+Robot Operating System 2 — le plus gros déploiement DDS user-visible.
+Voir [ROS 2 au-dessus de DDS](#docs/ros2).
+
+### RTPS
+**Real-Time Publish-Subscribe Protocol** — le wire protocol standardisé
+par l'OMG que les implémentations DDS parlent. Indépendant de l'API
+DDS.
+
+### RustDDS
+Une implémentation DDS pure Rust par Atostek. Le backend default de
+cette app.
+
+### Sample
+Une valeur envoyée à travers un writer vers un reader sur un topic.
+
+### SEDP
+**Simple Endpoint Discovery Protocol** — le suivi de SPDP où les
+participants échangent les infos writer/reader sur les quatre topics
+builtin `DCPSPublication`/`DCPSSubscription`/`DCPSTopic`. Voir
+[Discovery](#docs/discovery).
+
+### SPDP
+**Simple Participant Discovery Protocol** — le bootstrap multicast-based
+où les participants annoncent leur existence. Voir
+[Discovery](#docs/discovery).
+
+### TopicKind
+WITH_KEY ou NO_KEY. Fait partie de l'identité d'un topic.
+
+### TransientLocal
+Une valeur QoS Durability : garder les samples écrits dans le cache
+local du writer pour que les late joiners puissent les replay.
+
+### Vendor / VendorId
+Un identifiant de 2 bytes en SPDP disant quelle implémentation DDS
+parle. Pretty-print dans la sidebar Participants.
+
+### Volatile
+La Durability par défaut — les late joiners ne reçoivent rien du
+passé.
+
+### WITH_KEY
+Un kind de topic où les samples sont groupés par un champ clé en
+instances indépendantes.
+
+### XCDR2
+Le variant CDR plus récent (ajouté par la spec XTypes 1.x) supportant
+les champs optional, types mutables, et compat forward/backward.
+
+### XTypes
+La spec OMG pour la discovery de type dynamique, évolution de type,
+et type-checking de compatibilité sur DDS. RustDDS a un support
+partiel ; HDDS a un support 1.3 complet.

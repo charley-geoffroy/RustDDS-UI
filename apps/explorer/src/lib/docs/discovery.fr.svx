@@ -1,0 +1,158 @@
+# Discovery — comment les pairs se trouvent
+
+DDS n'a pas de broker, pas de registry, pas de fichier de config
+listant les pairs. Un participant démarre, rejoint un domain, et en
+quelques secondes il sait qui d'autre est sur le bus, ce qu'ils
+publient, ce à quoi ils sont abonnés, avec quelle QoS.
+
+Le mécanisme est lui-même implémenté comme des topics DDS — la
+discovery passe par les mêmes primitives que les données applicatives.
+
+## Les trois protocoles
+
+| Phase | Protocole | Rôle | Transport |
+|---|---|---|---|
+| **0** — bootstrap | **SPDP** (Simple Participant Discovery) | "J'existe, voici comment me joindre" | UDP multicast |
+| **1** — échange d'endpoints | **SEDP** (Simple Endpoint Discovery) | "Voici mes Writers et Readers" | UDP unicast (reliable) |
+| **2** — liveliness | **Assertion de liveliness** | "Je suis toujours vivant" | UDP unicast |
+
+Les phases 0 et 1 se succèdent au démarrage. La phase 2 tourne en
+continu après.
+
+## Phase 0 — SPDP (bootstrap multicast)
+
+Chaque DomainParticipant envoie périodiquement (≈ toutes les 5 s par
+défaut) une **annonce de soi** sur un groupe multicast well-known,
+dérivé du domain ID :
+
+```
+groupe  = 239.255.0.1               (défaut IPv4)
+port    = 7400 + 250 × domain_id    (donc domain 0 = port 7400)
+```
+
+L'annonce porte :
+
+- Le **GuidPrefix** du participant (12 bytes, voir [Endpoints, GUIDs,
+  instances](#docs/endpoints))
+- Son **VendorId** — les 2 bytes qui te disent quelle implémentation
+  DDS parle (c'est ce que la sidebar Participants de l'Explorer
+  pretty-print comme `RustDDS`, `FastDDS`, etc.)
+- Ses **locators** — les adresses IP et ports UDP où il est joignable
+  en unicast
+- Sa **lease duration** — combien de temps les pairs doivent le
+  garder "vivant" sans l'entendre à nouveau
+- Optionnellement un `entity_name`
+
+N'importe quel participant sur le même domain et même LAN écoute le
+groupe multicast, donc il reçoit l'annonce de chaque autre participant
+dans les ≈ 5 s suivant son démarrage.
+
+C'est tout pour le multicast — il n'est utilisé que pour SPDP. Tout
+ce qui suit est en unicast.
+
+## Phase 1 — SEDP (le gros du travail)
+
+Une fois que deux participants se connaissent (via SPDP), ils
+s'échangent la liste de leurs **DataWriters et DataReaders** via
+quatre topics builtin dédiés, appelés les **topics SEDP** :
+
+| Topic builtin | Type | Rôle |
+|---|---|---|
+| `DCPSPublication` | `DiscoveredWriterData` | "Voici mes DataWriters" |
+| `DCPSSubscription` | `DiscoveredReaderData` | "Voici mes DataReaders" |
+| `DCPSTopic` | `DiscoveredTopicData` | (Optionnel) metadata topic-level |
+
+Chaque annonce d'endpoint inclut :
+
+- Le **GUID** de l'endpoint
+- Le **topic name** et **type name**
+- Les **paramètres QoS** complets
+- Optionnellement de la metadata extra (user_data, partition, etc.)
+
+C'est lu-et-cachée : un participant s'abonne à ces topics builtin avec
+QoS Reliable + TransientLocal, donc même les late joiners ont l'image
+complète (chaque endpoint publié avant qu'ils joignent apparaît
+toujours via le cache TransientLocal).
+
+Une fois qu'un participant voit un DataWriter distant sur le topic
+`Chatter` avec une QoS compatible avec un de ses DataReaders locaux
+sur `Chatter`, il **match** la paire et commence à envoyer les données
+dès que l'utilisateur appelle `write()`.
+
+## Phase 2 — Liveliness
+
+Pour les endpoints matchés avec `Liveliness::Automatic` ou
+`Liveliness::ManualByParticipant`, les participants écrivent
+périodiquement sur le 5ᵉ topic builtin :
+
+| Topic builtin | Type | Rôle |
+|---|---|---|
+| `DCPSParticipantMessage` | `ParticipantMessageData` | "Je suis toujours vivant" |
+
+C'est plus rapide que la lease SPDP — typiquement toutes les ≈ 1 s —
+et permet aux pairs de détecter un publisher crashé rapidement sans
+attendre l'expiration complète de la lease.
+
+Si `Liveliness::ManualByTopic` est set, l'application elle-même doit
+appeler une API `assert_liveliness()` sur chaque writer au rythme
+spécifié par la QoS.
+
+## Les 5 topics builtin dans la sidebar
+
+Si tu étends **System** dans la sidebar de l'Explorer tu les vois tous :
+
+| Entrée sidebar | Phase | Rôle |
+|---|---|---|
+| `DCPSParticipant` | 0 | SPDP — les annonces multicast |
+| `DCPSPublication` | 1 | SEDP — endpoints writers |
+| `DCPSSubscription` | 1 | SEDP — endpoints readers |
+| `DCPSTopic` | 1 | SEDP — metadata topic optionnelle |
+| `DCPSParticipantMessage` | 2 | Pings liveliness |
+
+Chacun affiche `1 writer · 1 reader` parce que **chaque participant**
+(y compris le tien) a un Writer et un Reader sur chacun de ces topics.
+La sidebar reporte tes propres endpoints builtin parce que le multicast
+en loopback te renvoie ton SPDP à toi-même, et tu te découvres comme
+si tu étais un pair distant — le protocole ne fait pas de cas spécial
+pour la self-discovery.
+
+La structure détaillée des payloads pour chacun vit dans [Les 5 topics
+builtin, en détail](#docs/builtin-topics).
+
+## Ce que tu observes dans l'Explorer
+
+1. **Lance l'UI sans aucun autre processus DDS.** Tu vois ton propre
+   participant sous Participants et les 5 topics System, chacun avec
+   1 writer et 1 reader. Pas de User topic. C'est la vue "je parle
+   tout seul" en steady-state.
+2. **Lance `pub-rustdds` dans un autre terminal.** En ≈ 2 s
+   une nouvelle entrée apparaît sous Participants (avec le vendor
+   `RustDDS` et un entity_name si défini). Le topic `Chatter`
+   apparaît sous User topics avec `1 writer · 0 readers`.
+3. **Ajoute `sub-rustdds`.** Un 3ᵉ participant apparaît, et
+   Chatter passe à `1 writer · 1 reader`.
+4. **Tue le publisher (Ctrl-C).** Après ≈ 5–10 s (sa lease SPDP), il
+   disparaît de Participants. Chatter revient à `0 writer · 1 reader`
+   ou disparaît entièrement si aucun endpoint ne reste.
+
+Ce timing — instantané à l'ajout, lagué à la suppression — est
+intrinsèque à SPDP : la discovery est opportuniste et basée sur lease,
+pas sur handshake.
+
+## Ce qui casse la discovery
+
+- **Pas de multicast.** SPDP a besoin d'UDP multicast sur le LAN.
+  Dans les environnements cloud, les réseaux Docker bridge, certains
+  VPNs, et la plupart des WiFi guests, le multicast est bloqué ou peu
+  fiable. Contournement : configurer chaque pair avec une **peer list**
+  statique pour que les paquets SPDP partent en unicast vers des
+  adresses connues (la plupart des libs DDS le supportent).
+- **TTL trop bas.** Le TTL multicast par défaut est 1 — les paquets ne
+  quittent pas le subnet local. Inutile à travers les routeurs.
+- **Domain IDs différents.** Domain 0 et domain 1 sont invisibles l'un
+  pour l'autre sur le même fil.
+- **Firewalls.** macOS demande au premier run ; si refusé, aucun
+  trafic.
+
+> Prochain : **Endpoints, GUIDs, instances** décode les identifiants
+> de 16 bytes que tu fixes depuis tout le chapitre.

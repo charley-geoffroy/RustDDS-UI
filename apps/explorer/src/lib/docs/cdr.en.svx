@@ -1,0 +1,249 @@
+<script>
+  import CdrFrameDecoder from "$lib/decoders/CdrFrameDecoder.svelte";
+</script>
+
+# Serialization — from hex to text
+
+When you click a sample in the **Samples** tab, the right pane shows
+something like:
+
+```
+00 01 00 00 b3 a2 01 00 00 00 00 00 00 00 00 00
+00 00 00 00 00 00 00 00 fc 04 21 18 a6 e3 25 18
+09 00 00 00 68 65 6c 6c 6f 20 23 30 00 00 00 00
+```
+
+That's the **CDR** (Common Data Representation) — the OMG-standardized
+wire format every DDS-compliant implementation uses by default. Reading
+it byte-by-byte once gives you the X-ray vision that turns "mysterious
+bytes" into "ah, that's the counter, and that's the string".
+
+This chapter teaches you to decode it from scratch. We end with a fully
+annotated walkthrough of a real `Chatter` sample.
+
+## The RTPS payload header (4 bytes)
+
+Every CDR-encoded payload starts with a 4-byte **encapsulation header**:
+
+```
+┌──────────┬──────────┬──────────┬──────────┐
+│ Repr ID                │ Options             │
+│ (2 bytes, big-endian)  │ (2 bytes)           │
+└──────────┴──────────┴──────────┴──────────┘
+```
+
+The first 2 bytes — the **RepresentationIdentifier** — tell you which
+encoding follows:
+
+| Bytes | Meaning |
+|---|---|
+| `00 00` | CDR Big-Endian (CDR_BE) |
+| `00 01` | CDR Little-Endian (CDR_LE) — x86 default |
+| `00 02` | PL_CDR_BE — parameter-list big-endian (used by discovery payloads) |
+| `00 03` | PL_CDR_LE — parameter-list little-endian (discovery default) |
+| `00 06` | XCDR2_BE — used by XTypes |
+| `00 07` | XCDR2_LE |
+| `00 0a` | DELIMITED_CDR — length-prefixed variant |
+
+The 2 options bytes are a Flags byte and a reserved byte for XCDR2;
+zero in plain CDR.
+
+The header tells the decoder *how* to read what follows. The rest of the
+sample is the actual struct, encoded byte-by-byte.
+
+## Primitive encoding
+
+After the header, struct fields are concatenated according to their
+declared type. Each primitive has a fixed encoding:
+
+| Type | Bytes | Encoding |
+|---|---|---|
+| `bool`, `octet`, `int8` | 1 | direct |
+| `int16`, `uint16` | 2 | endian-flipped per header |
+| `int32`, `uint32`, `float` | 4 | endian-flipped per header |
+| `int64`, `uint64`, `double` | 8 | endian-flipped per header |
+| `char` | 1 | ASCII byte |
+| `wchar` | 2 or 4 | depends on platform — avoid |
+
+### Strings
+
+```
+┌──────────────────┬─────────────────────────────────┐
+│ length (uint32)  │ N bytes UTF-8 + '\0' terminator │
+└──────────────────┴─────────────────────────────────┘
+```
+
+The length field is the **byte count including the trailing null**,
+not the visible character count.
+
+### Sequences
+
+A sequence (variable-length array) is a length followed by the elements:
+
+```
+┌──────────────────┬───────────────────────────┐
+│ length (uint32)  │ N elements, packed        │
+└──────────────────┴───────────────────────────┘
+```
+
+### Arrays
+
+Fixed-size arrays carry **no length** — N elements directly:
+
+```
+┌────────────────────────────────────────────┐
+│ N elements (the count is part of the type) │
+└────────────────────────────────────────────┘
+```
+
+### Structs and nested types
+
+A struct's fields are simply concatenated in declared order, with
+alignment in between (see next section).
+
+## Alignment — the gotcha
+
+CDR pads bytes so that **each primitive is aligned to its own size**:
+
+- `uint32` starts on an offset divisible by 4
+- `uint64` and `double` start on an offset divisible by 8
+- Strings, sequences: the *length* word (uint32) needs 4-byte alignment;
+  the contents don't
+
+The alignment offset is measured **from the start of the payload (after
+the 4-byte header)** — not from the start of the packet.
+
+This is the source of most hand-decoding confusion: you stare at a
+sample, see seemingly random `00 00 00 00` bytes, and don't realize
+they're alignment padding.
+
+## Worked example — decoding a `Chatter` sample
+
+Our `Chatter` struct is:
+
+```rust
+struct Chatter {
+    publisher_id: u32,
+    counter: u64,
+    stamp_ns: u64,
+    text: String,
+}
+```
+
+Click each byte (or each chip below the hex) to see how it decodes.
+The trace is a real `Chatter` sample published with
+`counter = 13` and `text = "hello #13"`. The 4-byte CDR header is
+stripped — the bytes below are the struct body only.
+
+<CdrFrameDecoder
+  hex="a8ff0000 00000000 0d000000 00000000 e846ed92 d75fb018 0a000000 6865 6c6c 6f20 2331 3300 0000"
+  lang="en"
+  title={{ en: "Chatter sample · CDR_LE", fr: "Sample Chatter · CDR_LE" }}
+  fields={[
+    {
+      offset: 0, length: 4, name: "publisher_id", type: "u32",
+      value: "65448 (0x0000ffa8)",
+      note: {
+        en: "Little-endian unsigned 32-bit integer. Set by the publisher to std::process::id().",
+        fr: "Entier 32-bit non signé en little-endian. Mis par le publisher à std::process::id().",
+      },
+    },
+    {
+      offset: 4, length: 4, name: "(padding)", type: "—",
+      value: "00 00 00 00",
+      note: {
+        en: "The next field is u64 and must start on an offset divisible by 8. We're at offset 4, so 4 bytes of zero padding align to 8.",
+        fr: "Le champ suivant est u64 et doit démarrer sur un offset divisible par 8. On est à l'offset 4, donc 4 bytes de padding zéro alignent à 8.",
+      },
+    },
+    {
+      offset: 8, length: 8, name: "counter", type: "u64",
+      value: "13",
+      note: {
+        en: "Little-endian 64-bit integer. Incremented by the publisher on every write.",
+        fr: "Entier 64-bit en little-endian. Incrémenté par le publisher à chaque write.",
+      },
+    },
+    {
+      offset: 16, length: 8, name: "stamp_ns", type: "u64",
+      value: "0x18b05fd792ed46e8 ns ≈ 2026-05-17",
+      note: {
+        en: "Nanoseconds since UNIX epoch, captured by the publisher at write time.",
+        fr: "Nanosecondes depuis l'epoch UNIX, capturé par le publisher au moment du write.",
+      },
+    },
+    {
+      offset: 24, length: 4, name: "text.length", type: "u32",
+      value: "10",
+      note: {
+        en: "String length INCLUDING the mandatory null terminator. \"hello #13\" is 9 chars + 1 = 10.",
+        fr: "Longueur de la string INCLUANT le null terminator obligatoire. \"hello #13\" fait 9 chars + 1 = 10.",
+      },
+    },
+    {
+      offset: 28, length: 9, name: "text content", type: "char[9]",
+      value: "\"hello #13\"",
+      note: {
+        en: "UTF-8 bytes of the string content, no length prefix here — that came right before.",
+        fr: "Bytes UTF-8 du contenu de la string, pas de préfixe de longueur ici — il vient juste avant.",
+      },
+    },
+    {
+      offset: 37, length: 1, name: "text null", type: "char",
+      value: "\\0",
+      note: {
+        en: "CDR strings always end with a null byte. Counted in text.length.",
+        fr: "Les strings CDR finissent toujours par un byte null. Compté dans text.length.",
+      },
+    },
+    {
+      offset: 38, length: 2, name: "(trailing)", type: "—",
+      value: "00 00",
+      note: {
+        en: "UDP frame zero-padding, not part of the CDR payload.",
+        fr: "Padding zéro du frame UDP, pas partie du payload CDR.",
+      },
+    },
+  ]}
+/>
+
+### What you just decoded
+
+- **Alignment** is per-field, measured from the start of the payload.
+  The 4 bytes of padding between `publisher_id` (offset 4) and
+  `counter` (offset 8) exist solely to align the u64.
+- **Strings** are length-prefixed (uint32) and **null-terminated**.
+  The length counts the null. Decoders that ignore this get
+  off-by-one errors.
+- **Numeric endianness** comes from the encapsulation header (stripped
+  here). `CDR_LE` means every multi-byte integer is little-endian.
+- **Trailing bytes** outside the declared struct are not part of the
+  CDR payload — they're UDP framing artifacts.
+
+## Reading the bytes in the app
+
+The Samples tab has a **hex / ascii** toggle:
+
+- **hex** — what we just decoded above
+- **ascii** — same bytes, printable characters shown directly (the
+  `text` field reads as `hello #0`, non-printables as `.`)
+
+## Other CDR constructs
+
+- **Optional fields**: classic CDR has no concept of optional. XCDR2
+  (DELIMITED_CDR) adds a delimiter-length scheme that lets readers
+  skip unknown trailing fields — the foundation for XTypes
+  forward/backward compatibility.
+- **Enums**: serialized as `int32` (the discriminator value), unless
+  the IDL specifies a different underlying integer type.
+- **Unions**: discriminator first, then the selected branch — total
+  size varies sample to sample.
+- **Nested structs**: inline. The alignment context carries on from
+  the parent struct's offset.
+- **Mutability flag** in XCDR2: extra byte indicating whether the
+  struct is mutable (fields tagged with member-IDs) or appendable
+  (fields can be added at the end only). Affects how decoders skip
+  unknown fields.
+
+> Next: **The 5 builtin topics, in detail** — the same decoding
+> applied to SPDP/SEDP payloads.

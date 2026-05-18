@@ -1,0 +1,77 @@
+# Backends
+
+This app is structured so the **frontend doesn't know which DDS library
+is doing the talking**. A backend module sits between the Tauri commands
+and the actual DDS implementation, exposing a small `DdsBackend` trait
+that any pure-Rust DDS library can fulfill.
+
+## Currently supported
+
+| Backend | Status | Notes |
+|---|---|---|
+| **RustDDS** | ✅ shipped | The default and only backend right now. Pure Rust, OMG-compliant on the wire, interoperable with the major DDS vendors. Used in production by Atostek and several ROS 2 deployments. |
+| **HDDS** | 🔜 planned | Another pure-Rust DDS implementation, with XTypes 1.3 support out of the box. Will be valuable for the [Type tab](#docs/cdr) — XTypes means we can decode arbitrary topics without asking the user to upload an IDL. |
+| **RTPS sniff** | 💭 idea | A no-DDS-library mode that parses RTPS off the wire directly (like Wireshark does). Truly vendor-agnostic: works against RTI Connext, FastDDS, CycloneDDS, OpenDDS, anything that speaks RTPS. Trade-off: read-only — we observe, we can't publish. |
+
+## Why a backend abstraction at all?
+
+Three reasons:
+
+1. **No DDS lib is universal.** Each has different strengths
+   (interoperability quirks, language bindings, embedded support,
+   licensing). Locking the UI to one means turning users away.
+2. **Substitution catches abstraction leaks.** Forcing a second backend
+   reveals where we accidentally relied on RustDDS quirks. The trait
+   becomes solid by being exercised twice.
+3. **A daemon mode might eventually be a backend too.** A "RemoteDds"
+   that talks to an inspector daemon over the network would slot in as
+   yet another implementation, enabling remote inspection of robots and
+   embedded devices.
+
+## What we *don't* support, and why
+
+The big commercial / popular DDS vendors — **RTI Connext**, **eProsima
+FastDDS**, **Eclipse CycloneDDS**, **OCI OpenDDS** — are not currently
+usable as a backend because we don't have Rust bindings to them. There
+are three workable paths if someone wanted to add them:
+
+- **FFI bindings.** Wrap the vendor's C API. Heavy, version-sensitive.
+- **A sidecar process.** Spawn the vendor's CLI tools (`rtiddsspy`,
+  `cyclonedds dump`) and parse their output. Brittle but possible.
+- **The RTPS sniff backend.** Once that exists, you don't need
+  vendor-specific code at all to observe their traffic.
+
+The third option is the path we'd take long-term, because it solves the
+problem **for all vendors at once** — RTPS is the wire standard.
+
+## Choosing a backend
+
+Currently: you can't, RustDDS is the only one. Once HDDS lands the choice
+will be at compile time (Cargo feature flag), and possibly at runtime via
+a config setting if both end up in the same binary.
+
+When choosing eventually:
+
+- **Default → RustDDS** if you're inspecting a ROS 2 system or a Rust DDS
+  application.
+- **HDDS** if you want **dynamic type decoding** without manually
+  uploading IDL files, or if you need to talk to embedded targets that
+  use HDDS' `no_std` flavor.
+- **RTPS sniff** if you want to observe a network where the publishers
+  are RTI Connext / FastDDS / CycloneDDS / OpenDDS (or any mix), and you
+  don't need to publish anything yourself.
+
+## Limitations per backend
+
+| | RustDDS | HDDS (planned) | RTPS sniff (planned) |
+|---|---|---|---|
+| Discovery (SPDP/SEDP) | ✅ | ✅ | ✅ — by parsing builtin topics |
+| Subscribe to user topics | ✅ | ✅ | ✅ — read-only |
+| Subscribe to builtin topics | ✅ via `BytesAdapter` | ✅ | ✅ |
+| **Publish** | ✅ (not exposed in UI yet) | ✅ planned | ❌ by design |
+| XTypes / dynamic type decode | ❌ — need IDL upload (Phase 4) | ✅ native | ⚠️ partial — type info only when SEDP includes TypeObject |
+| DDS Security | ✅ via `security` feature | ✅ DDS-Security 1.1 | ⚠️ can observe but not decrypt secure topics |
+| Cross-vendor interop | ✅ tested vs RTI/Fast/Cyclone/OpenDDS | ✅ 48/48 OMG tests | ✅ — agnostic by construction |
+
+> The next chapter — **Glossary** — gives a quick A→Z of every term used
+> throughout the docs.

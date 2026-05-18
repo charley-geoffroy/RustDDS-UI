@@ -1,0 +1,153 @@
+# The DDS objects
+
+DDS is built around five core objects. Once you know what each does and
+how they relate, the rest of the spec falls into place. Every DDS
+implementation (RustDDS, HDDS, FastDDS, RTI Connext, …) exposes these
+same concepts — only the spelling differs.
+
+```
+                            ┌─────────────────────┐
+                            │  DomainParticipant  │  joins a numbered domain
+                            └──────────┬──────────┘
+                  ┌────────────────────┼────────────────────┐
+                  │                    │                    │
+                  ▼                    ▼                    ▼
+            ┌──────────┐         ┌──────────┐         ┌──────────┐
+            │  Topic   │         │Publisher │         │Subscriber│
+            │ (typed)  │         │          │         │          │
+            └────┬─────┘         └────┬─────┘         └────┬─────┘
+                 │                    │                    │
+                 │              ┌─────▼──────┐       ┌─────▼──────┐
+                 ├─────────────▶│ DataWriter │       │ DataReader │◀───┤
+                 │              └────────────┘       └────────────┘    │
+                 └─────────────────────────────────────────────────────┘
+                              same Topic on both sides
+```
+
+Read it like this: a `DomainParticipant` owns a `Publisher` (and a
+`Subscriber`). The Publisher owns one or more `DataWriter`s. Each writer
+is bound to one `Topic`. On the receiving side, the `Subscriber` owns
+`DataReader`s bound to the same `Topic`. **Discovery and QoS matching**
+connect a writer on one participant to a reader on another participant
+when they share a topic name, type, and compatible QoS.
+
+## DomainParticipant
+
+Your entry point. Creating one joins a logical **domain** (a number from
+0 to 232) and starts the discovery machinery in the background.
+
+```rust
+// Using this project's backend abstraction:
+let (events_tx, _events_rx) = std::sync::mpsc::channel();
+let backend = RustDdsBackend::start(0, events_tx)?;
+```
+
+Behind that single line, any compliant DDS implementation:
+
+- Opens UDP sockets bound to ports derived from the domain ID
+  (`7400 + 250 × domain_id` for multicast on domain 0).
+- Joins the well-known SPDP multicast group.
+- Spawns internal builtin DataReaders/DataWriters on the 5
+  [system topics](#docs/discovery) you see in the sidebar.
+- Starts sending periodic announcements.
+
+You typically create **one DomainParticipant per process**. Creating more
+is legal but doubles every socket, every cache, every timer.
+
+In the **Explorer**, your own DomainParticipant is the source of the
+endpoints attached to the System topics. Remote participants show up
+under **Participants** in the sidebar.
+
+## Topic
+
+A `Topic` is the typed contract for a stream of samples. It carries:
+
+- A **name** — an opaque string identifier (`Chatter`, `/cmd_vel`, etc.).
+- A **type name** — a string describing the payload's schema
+  (`Chatter`, `geometry_msgs::msg::dds_::Twist_`).
+- A **kind** — `WITH_KEY` or `NO_KEY`. WITH_KEY topics multiplex many
+  independent streams (called *instances*) distinguished by a key field;
+  NO_KEY topics carry a single stream.
+- Default **QoS** that writers and readers inherit unless overridden.
+
+Topic identity is the `(name, type_name, kind)` triple. Two participants
+agreeing on those three pieces is what makes their writers and readers
+match.
+
+In the **Explorer**, every entry in the Topics list shows the name and
+type. Hover the builtin (System) ones for tooltips explaining their role.
+
+## Publisher and Subscriber
+
+Containers for writers and readers. They hold a shared default QoS and
+a `Partition` policy that scopes which writers/readers can see each
+other.
+
+They are not exposed in the **Explorer** — they don't appear in
+discovery; only the writers and readers they own do.
+
+## DataWriter and DataReader
+
+The objects that do the work. Through this project's
+[`dds-backend`](#docs/backends) crate, that's:
+
+```rust
+// Publishing side (any backend that implements DdsBackend)
+let publisher = backend.create_typed_publisher::<Chatter>(
+    "Chatter", "Chatter",
+)?;
+publisher.write(Chatter { /* ... */ })?;
+
+// Subscribing side
+let mut subscriber = backend.create_typed_subscriber::<Chatter>(
+    "Chatter", "Chatter",
+)?;
+if let Some(sample) = subscriber.take_next(Duration::from_millis(500))? {
+    println!("got: {sample:?}");
+}
+```
+
+That's exactly the code in `pub-rustdds` and `sub-rustdds`.
+Swap the backend import and you get `pub-hdds` / `-sub-hdds` —
+the helper signature stays identical because the concepts are the same.
+
+A `DataWriter<T>` is parameterized by the payload type `T` and ships
+samples of that type onto its topic. A `DataReader<T>` deserializes
+incoming samples back into `T`.
+
+The inspector UI takes a different path: it subscribes to **raw bytes**
+via the agnostic `spawn_raw_subscription` method of `DdsBackend`, so it
+can observe any topic regardless of whether the type is known at
+compile time.
+
+Each writer and each reader has its **own GUID** — a 16-byte identifier
+that uniquely names it on the DDS bus. The first 12 bytes are the
+GuidPrefix (shared with all entities on the same participant); the last
+4 are the EntityId. The [Endpoints, GUIDs, instances
+chapter](#docs/endpoints) breaks them down.
+
+In the **Explorer**, the writers and readers you see in the sidebar's
+counts (`1↑ 1↓`) and in a topic's **Endpoints** tab are exactly these
+objects.
+
+## Listeners and WaitSets
+
+The DDS spec defines two ways to be notified that data arrived:
+**Listeners** (callbacks) and **WaitSets** (blocking wait on multiple
+conditions). Rust implementations often expose `mio::Source` or
+`futures::Stream` instead, fitting Rust idioms. C++ vendors implement
+the spec APIs directly.
+
+## Quick reference
+
+| Object | Where you see it in the Explorer |
+|---|---|
+| DomainParticipant | "Participants" section of the sidebar (and your own, implicit). |
+| Topic | "User topics" and "System" sections of the sidebar. |
+| Publisher / Subscriber | Not surfaced — they're internal containers. |
+| DataWriter | Topic detail → "Endpoints" tab → Writers. Sidebar `↑` counter. |
+| DataReader | Topic detail → "Endpoints" tab → Readers. Sidebar `↓` counter. |
+| QoS | Topic detail → "QoS" tab. Inherited from the publisher/subscriber by default. |
+
+> Next: **Discovery — how peers find each other** explains the
+> protocol that turns isolated participants into a connected bus.

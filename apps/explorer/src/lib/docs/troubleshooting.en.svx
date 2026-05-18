@@ -1,0 +1,178 @@
+# Troubleshooting
+
+A flat list of symptoms → diagnostic step → likely fix. Skim by symptom.
+
+## "I don't see any participants in the sidebar"
+
+**Diagnosis steps:**
+
+1. Wait 5–10 s. SPDP announcements go out every ~5 s, and you'll
+   discover yourself first.
+2. Check the backend badge in the topbar shows a real backend (not
+   `hdds (stub)` — the stub never produces traffic).
+3. Open the terminal where `pnpm tauri dev` runs. The backend prints
+   discovery thread logs. If silent, something failed at participant
+   start.
+
+**Likely causes:**
+
+- The `DOMAIN_ID` is wrong. The app hard-codes `0` in
+  `apps/explorer/src-tauri/src/lib.rs`; if your other DDS process is on
+  domain `1`, they won't see each other.
+- macOS denied the network permission on first launch. Check
+  System Settings → Network → Firewall.
+- A VPN is intercepting multicast. Try with VPN off.
+
+## "I see a topic with N writers but 0 samples arrive when I inspect"
+
+This is the classic **QoS mismatch**. The writer is offering one
+guarantee level, the inspector's reader is asking for a stricter one.
+
+**Diagnosis steps:**
+
+1. Click the topic, switch to the **QoS** tab. The matrix shows red
+   cells where the pair is incompatible, with the offending policy
+   named.
+2. The inspector defaults to Reliable + Volatile + KeepLast(100); a
+   writer offering `BestEffort` will not satisfy that reader.
+
+**Fix:** edit `default_inspector_qos()` in
+`crates/dds-backend/src/rustdds.rs` to match the writer (typically
+relaxing to `BestEffort`).
+
+See the [QoS chapter](#docs/qos) for the matching rules.
+
+## "The topic just vanished from the sidebar even though the publisher is still running"
+
+Topics are tracked as "alive" only as long as **at least one endpoint**
+(writer or reader) is detected for them. If the publisher's SPDP lease
+expires (because it stopped announcing for ~10 s), all its endpoints go
+away and the topic does too.
+
+**Causes:**
+
+- The publisher process froze. Check it.
+- The publisher's SPDP lease is short and announcements aren't getting
+  through (overloaded network, firewall hiccups).
+- You inspected a topic created locally by your own DomainParticipant
+  with `create_topic` and then unsubscribed; the local topic also
+  disappears.
+
+## "Two of my participants on the same machine can't see each other"
+
+Loopback multicast is the usual culprit.
+
+**Diagnosis:**
+
+```sh
+# Linux: check the loopback interface has the RTPS multicast group
+ip maddr show lo
+# Should list 239.255.0.1 once a participant is running
+
+# macOS: check the routing for multicast
+netstat -gn | grep 239
+```
+
+**Fix:**
+
+- Linux: `ip link set lo multicast on` (rare to be off, but possible).
+- macOS: usually works out of the box; the firewall prompt covers it.
+- Docker: containers on `bridge` network can't multicast each other.
+  Use `--network=host` or set up an explicit peer list per participant.
+
+## "Discovery worked yesterday, broken today — same setup"
+
+Common on dev laptops:
+
+- A new VPN is up. The VPN's virtual interface is now the "first"
+  network and DDS is picking it for multicast.
+- A new WiFi network with multicast filtering (corporate / guest).
+- A new Docker bridge interfering with routing.
+
+**Diagnosis:**
+
+```sh
+# What interfaces does DDS see?
+RUST_LOG=rustdds=debug cargo run -p explorer 2>&1 | grep -i 'interface\|locator'
+```
+
+You'll see the list of interfaces enumerated. The one being used for
+multicast is the one announced in your SPDP `default_multicast_locator`.
+
+**Fix:**
+
+- Disable the offending interface temporarily, or
+- Configure the backend to bind to a specific interface (RustDDS
+  supports `with_only_networks()`).
+
+## "The Samples tab shows samples but the rate counter shows 0 Hz"
+
+The rate is an exponential moving average over the last few seconds. If
+samples arrive in bursts (one every few seconds), the average can drop
+to nearly zero between bursts.
+
+**Not a bug** unless you expect a steady rate and see actually nothing.
+Check the `N total · M kept` counter — if `total` is increasing,
+samples ARE arriving.
+
+## "I clicked inspect on a topic and got 'create_datareader failed'"
+
+Two failures we've seen in practice:
+
+1. **TopicKind mismatch.** The backend tries WITH_KEY first, falls back
+   to NO_KEY. If both fail, the topic might be one we don't yet support
+   (security-flagged builtin topic, for instance).
+2. **Mio "receiver already registered".** Cascading effect of a previous
+   subscription that failed mid-setup and didn't clean up. Restart the
+   UI.
+
+The terminal running `pnpm tauri dev` has the full error in the
+`subscription '...' ended: ...` log line.
+
+## "I can't inspect a builtin (System) topic"
+
+Some builtin topics — especially the `DCPSParticipantsSecure` family if
+DDS-Security is active — are gated by the implementation. The inspector
+will fail to create a reader on them. Today the workaround is "skip
+them"; security-aware inspection is not planned in the near term.
+
+The five non-secure ones (DCPSParticipant, DCPSPublication,
+DCPSSubscription, DCPSTopic, DCPSParticipantMessage) **should** all be
+inspectable. If one isn't, file an issue — that's a real bug.
+
+## "I see lots of participants and topics from machines I don't know"
+
+You're on a shared network where someone else is running DDS on the
+same domain ID. This is normal and one of the things this app makes
+visible.
+
+**Mitigation:** use a non-default domain ID for your own work. Edit
+`DOMAIN_ID` in `apps/explorer/src-tauri/src/lib.rs` and rebuild.
+
+## "The HDDS demos do nothing"
+
+Expected — the HDDS backend is a stub until HDDS publishes on
+crates.io. See the [Backends chapter](#docs/backends) for the full
+story and how to make it real.
+
+## When all else fails
+
+Logging is your friend:
+
+```sh
+# Maximum verbosity from RustDDS
+RUST_LOG=rustdds=trace cargo run -p explorer
+
+# Capture the actual UDP traffic
+sudo tcpdump -i lo0 -nn udp port 7400          # macOS
+sudo tcpdump -i lo  -nn udp port 7400          # Linux
+
+# Or open Wireshark with the rtps dissector — best tool to see what's
+# really on the wire, vs what the lib thinks it's seeing.
+```
+
+For protocol-level questions, the [Discovery](#docs/discovery) and
+[Serialization](#docs/cdr) chapters tell you what to expect at each
+layer.
+
+> Next: a small reference glossary covering every term in these docs.

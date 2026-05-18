@@ -1,0 +1,93 @@
+# What is DDS?
+
+DDS — the **Data Distribution Service** — is an OMG-standardized
+publish/subscribe middleware for real-time, decentralized data exchange
+between machines. In one sentence: **a typed, QoS-aware message bus with no
+broker**.
+
+That last part is worth pausing on. Most pub/sub systems you may have used
+route messages through a central server: MQTT brokers, Kafka clusters,
+RabbitMQ, NATS. DDS doesn't. Every process is a first-class peer that
+finds the others on its own and ships data directly to them. The absence
+of a broker is *the* defining trait of DDS, and it shapes everything else
+about how it works.
+
+## The mental model
+
+| Concept | Looks like |
+|---|---|
+| **Domain** | A numbered logical bus (`0`, `1`, … up to `232`). Two processes on the same domain can see each other. Two processes on different domains are invisible to each other, even on the same network. |
+| **Participant** | A process that joined a domain. |
+| **Topic** | A typed, named channel. Strings, ints, structs, anything `serde`-serializable. |
+| **DataWriter** | "I publish samples of type `T` to topic `X`." |
+| **DataReader** | "I want to receive samples of type `T` from topic `X`." |
+| **QoS** | A contract attached to writers and readers describing reliability, history, deadlines, etc. Both sides must agree or they don't match. |
+
+That's it. Discovery, matching, retransmission, deduplication — DDS does
+all of it under the hood.
+
+## Compared to things you may know
+
+- **MQTT** has a broker; DDS doesn't. MQTT topics are strings with
+  hierarchy (`+`/`#` wildcards); DDS topics are typed channels with
+  contracts.
+- **Kafka** is a durable, ordered log: producers append, consumers replay
+  from offsets. DDS is *live*-first: samples flow when they're written.
+  Some DDS QoS combinations approximate Kafka's "replay" behavior
+  (`Durability::TransientLocal` + `History::KeepLast`), but it's not the
+  default.
+- **gRPC / REST** are request/response. DDS is one-way publish, many-way
+  subscribe. There's a separate spec for request/response over DDS
+  (DDS-RPC), but the core is pub/sub.
+- **ROS 1** had its own pub/sub with a central master node. **ROS 2**
+  dropped that and uses DDS as its transport — that's the largest
+  user-visible DDS deployment today.
+
+## The role of RTPS
+
+The OMG standardizes two things:
+
+1. **DDS** — the application-facing API (DomainParticipant, Topic, etc.)
+2. **DDSI-RTPS** — the wire protocol (Real-Time Publish-Subscribe)
+
+You can mix-and-match vendors at the API level only via their proprietary
+APIs (RTI Connext, eProsima FastDDS, OpenDDS, CycloneDDS, RustDDS, …), but
+on the wire they all speak RTPS — that's why a publisher from one vendor
+can talk to a subscriber from another. The famous "Shapes demo" exists
+specifically to validate cross-vendor interop.
+
+When this app reads a sample with the **Samples** tab, what arrives on the
+socket is an RTPS DATA submessage carrying a CDR-encoded payload. You'll
+read all about that in the [serialization chapter](#docs/cdr).
+
+## Where DDS is used
+
+The list reads like a roster of latency-sensitive industries:
+
+- **Robotics** — every ROS 2 node, mobile robots, industrial arms.
+- **Aerospace & defense** — radar, mission systems, simulation networks.
+- **Autonomous vehicles** — perception, planning, control buses on
+  prototype stacks.
+- **Energy** — smart grid telemetry, SCADA.
+- **Air traffic control** — the original use case the spec was designed
+  around.
+- **Simulation** — distributed multi-host simulators (HLA-compatible).
+
+Common thread: systems where a broker can't be the single point of
+failure, peers must find each other on a private network, and missing
+a deadline matters more than dropping a byte.
+
+## How DDS differs from broker-based systems
+
+1. **Discovery is automatic.** A new participant takes a few seconds
+   to learn its peers. Once discovered, samples flow with near-zero
+   overhead.
+2. **QoS mismatches fail silently.** A `Reliable` reader does not
+   match a `BestEffort` writer. Both sides are visible in the
+   inspector but no samples arrive. See the [QoS chapter](#docs/qos).
+3. **Topics are typed at the middleware level.** A reader can't
+   subscribe to a topic with the wrong type. The type name is part
+   of the topic identity and travels through discovery.
+
+> The next chapter lists the DDS objects and maps each to where it
+> appears in the **Explorer**.

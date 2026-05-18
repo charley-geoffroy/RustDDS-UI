@@ -1,0 +1,187 @@
+# Dépannage
+
+Une liste plate de symptôme → étape diagnostic → fix probable. Skim
+par symptôme.
+
+## "Je ne vois aucun participant dans la sidebar"
+
+**Étapes diagnostic :**
+
+1. Attends 5–10 s. Les annonces SPDP partent toutes les ~5 s, et tu
+   te découvres toi-même en premier.
+2. Vérifie que le badge backend dans le topbar montre un vrai backend
+   (pas `hdds (stub)` — le stub ne produit jamais de trafic).
+3. Ouvre le terminal où `pnpm tauri dev` tourne. Le backend imprime
+   des logs du thread de discovery. Si silent, quelque chose a failed
+   au démarrage du participant.
+
+**Causes probables :**
+
+- Le `DOMAIN_ID` est faux. L'app hard-code `0` dans
+  `apps/explorer/src-tauri/src/lib.rs` ; si ton autre processus DDS
+  est sur domain `1`, ils ne se verront pas.
+- macOS a refusé la permission réseau au premier lancement. Check
+  System Settings → Network → Firewall.
+- Un VPN intercepte le multicast. Essaie avec le VPN off.
+
+## "Je vois un topic avec N writers mais 0 samples arrivent quand j'inspecte"
+
+C'est le classique **QoS mismatch**. Le writer offre un niveau de
+garantie, le reader de l'inspecteur en demande un plus strict.
+
+**Étapes diagnostic :**
+
+1. Click le topic, switch sur l'onglet **QoS**. La matrice montre les
+   cellules rouges où la paire est incompatible, avec la policy
+   fautive nommée.
+2. L'inspecteur utilise Reliable + Volatile + KeepLast(100) par
+   défaut ; un writer offrant `BestEffort` ne satisfera pas ce reader.
+
+**Fix :** édite `default_inspector_qos()` dans
+`crates/dds-backend/src/rustdds.rs` pour matcher le writer
+(typiquement relax en `BestEffort`).
+
+Voir le [chapitre QoS](#docs/qos) pour les règles de matching.
+
+## "Le topic vient juste de disparaître de la sidebar même si le publisher tourne encore"
+
+Les topics sont tracked comme "alive" seulement tant qu'**au moins un
+endpoint** (writer ou reader) est détecté pour eux. Si la lease SPDP
+du publisher expire (parce qu'il a arrêté d'annoncer pendant ~10 s),
+tous ses endpoints disparaissent et le topic aussi.
+
+**Causes :**
+
+- Le processus publisher a freeze. Check-le.
+- La lease SPDP du publisher est courte et les annonces ne passent
+  pas (réseau surchargé, hoquets firewall).
+- Tu as inspecté un topic créé localement par ton propre
+  DomainParticipant avec `create_topic` et tu t'es désabonné ; le
+  topic local disparaît aussi.
+
+## "Deux de mes participants sur la même machine ne se voient pas"
+
+Le multicast loopback est le coupable habituel.
+
+**Diagnostic :**
+
+```sh
+# Linux : check que l'interface loopback a le groupe multicast RTPS
+ip maddr show lo
+# Devrait lister 239.255.0.1 une fois qu'un participant tourne
+
+# macOS : check le routing pour le multicast
+netstat -gn | grep 239
+```
+
+**Fix :**
+
+- Linux : `ip link set lo multicast on` (rare d'être off, mais
+  possible).
+- macOS : marche habituellement out of the box ; la firewall prompt
+  couvre ça.
+- Docker : les containers sur réseau `bridge` ne peuvent pas se
+  multicaster entre eux. Utilise `--network=host` ou set up une peer
+  list explicite par participant.
+
+## "La discovery marchait hier, cassée aujourd'hui — même setup"
+
+Commun sur les laptops de dev :
+
+- Un nouveau VPN est up. L'interface virtuelle du VPN est maintenant
+  le "premier" réseau et DDS la pick pour le multicast.
+- Un nouveau WiFi avec filtrage multicast (corporate / guest).
+- Un nouveau bridge Docker qui interfère avec le routing.
+
+**Diagnostic :**
+
+```sh
+# Quelles interfaces DDS voit-il ?
+RUST_LOG=rustdds=debug cargo run -p explorer 2>&1 | grep -i 'interface\|locator'
+```
+
+Tu verras la liste des interfaces énumérées. Celle utilisée pour le
+multicast est celle annoncée dans ton `default_multicast_locator` SPDP.
+
+**Fix :**
+
+- Désactive temporairement l'interface coupable, ou
+- Configure le backend pour bind sur une interface spécifique (RustDDS
+  supporte `with_only_networks()`).
+
+## "L'onglet Samples montre des samples mais le compteur de rate montre 0 Hz"
+
+Le rate est une moyenne mobile exponentielle sur les dernières
+secondes. Si les samples arrivent en bursts (un toutes les quelques
+secondes), la moyenne peut tomber à presque zéro entre les bursts.
+
+**Pas un bug** sauf si tu attends un rate steady et que tu ne vois
+vraiment rien. Check le compteur `N total · M kept` — si `total`
+augmente, des samples ARRIVENT.
+
+## "J'ai cliqué inspect sur un topic et j'ai eu 'create_datareader failed'"
+
+Deux failures qu'on a vues en pratique :
+
+1. **Mismatch TopicKind.** Le backend essaie WITH_KEY en premier,
+   fall back NO_KEY. Si les deux fail, le topic pourrait être un
+   qu'on ne supporte pas encore (topic builtin security-flagged, par
+   exemple).
+2. **Mio "receiver already registered".** Effet en cascade d'une
+   subscription précédente qui a failed en mid-setup et n'a pas
+   cleanup. Restart l'UI.
+
+Le terminal qui run `pnpm tauri dev` a l'erreur complète dans la log
+line `subscription '...' ended: ...`.
+
+## "Je ne peux pas inspecter un topic builtin (System)"
+
+Certains topics builtin — surtout la famille
+`DCPSParticipantsSecure` si DDS-Security est actif — sont gated par
+l'implémentation. L'inspecteur fail à créer un reader dessus.
+Aujourd'hui le contournement est "skip-les" ; l'inspection
+security-aware est dans la roadmap très long-terme.
+
+Les cinq non-secure (DCPSParticipant, DCPSPublication,
+DCPSSubscription, DCPSTopic, DCPSParticipantMessage) **devraient**
+tous être inspectables. Si un ne l'est pas, file un issue — c'est un
+vrai bug.
+
+## "Je vois plein de participants et topics de machines que je ne connais pas"
+
+Tu es sur un réseau partagé où quelqu'un d'autre run du DDS sur le
+même domain ID. C'est normal et une des choses que cette app rend
+visibles.
+
+**Mitigation :** utilise un domain ID non-default pour ton propre
+travail. Édite `DOMAIN_ID` dans
+`apps/explorer/src-tauri/src/lib.rs` et rebuild.
+
+## "Les demos HDDS ne font rien"
+
+Attendu — le backend HDDS est un stub jusqu'à ce que HDDS publie sur
+crates.io. Voir le [chapitre Backends](#docs/backends) pour
+l'histoire complète et comment le rendre réel.
+
+## Quand tout le reste échoue
+
+Le logging est ton ami :
+
+```sh
+# Verbosité maximale de RustDDS
+RUST_LOG=rustdds=trace cargo run -p explorer
+
+# Capture le vrai trafic UDP
+sudo tcpdump -i lo0 -nn udp port 7400          # macOS
+sudo tcpdump -i lo  -nn udp port 7400          # Linux
+
+# Ou ouvre Wireshark avec le dissector rtps — meilleur outil pour
+# voir ce qu'il y a vraiment sur le fil, vs ce que la lib pense voir.
+```
+
+Pour les questions niveau protocole, les chapitres
+[Discovery](#docs/discovery) et [Sérialisation](#docs/cdr) te disent
+quoi attendre à chaque couche.
+
+> Prochain : une petite référence glossaire couvrant chaque terme de
+> ces docs.

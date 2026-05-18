@@ -1,0 +1,83 @@
+# Backends
+
+Cette app est structurée pour que **le frontend ne sache pas quelle
+lib DDS fait le boulot**. Un module backend se trouve entre les
+commands Tauri et l'implémentation DDS réelle, exposant un petit
+trait `DdsBackend` que n'importe quelle lib DDS pure Rust peut
+remplir.
+
+## Actuellement supportés
+
+| Backend | Statut | Notes |
+|---|---|---|
+| **RustDDS** | ✅ shipped | Le default et seul backend en place. Pure Rust, OMG-conforme sur le fil, interopérable avec les majeurs vendors DDS. Utilisé en production par Atostek et plusieurs déploiements ROS 2. |
+| **HDDS** | 🔜 planifié | Une autre implémentation DDS pure Rust, avec XTypes 1.3 support out of the box. Sera précieux pour l'[onglet Type](#docs/cdr) — XTypes signifie qu'on peut décoder des topics arbitraires sans demander à l'utilisateur d'uploader une IDL. |
+| **RTPS sniff** | 💭 idée | Un mode no-DDS-lib qui parse RTPS directement sur le fil (comme Wireshark). Vraiment vendor-agnostique : marche contre RTI Connext, FastDDS, CycloneDDS, OpenDDS, n'importe quoi qui parle RTPS. Trade-off : read-only — on observe, on ne peut pas publier. |
+
+## Pourquoi une abstraction backend tout court ?
+
+Trois raisons :
+
+1. **Aucune lib DDS n'est universelle.** Chacune a ses forces
+   (quirks d'interop, language bindings, support embedded, licensing).
+   Locker l'UI sur une seule, c'est tourner le dos à des users.
+2. **La substitution attrape les leaks d'abstraction.** Forcer un 2ᵉ
+   backend révèle où on s'est accidentellement appuyé sur des quirks
+   de RustDDS. Le trait devient solide en étant exercé deux fois.
+3. **Un mode daemon pourrait éventuellement être un backend aussi.**
+   Un "RemoteDds" qui parle à un daemon inspecteur sur le réseau
+   se mettrait en place comme encore une autre implémentation,
+   permettant l'inspection à distance de robots et devices embedded.
+
+## Ce qu'on **ne** supporte **pas**, et pourquoi
+
+Les gros vendors DDS commerciaux / populaires — **RTI Connext**,
+**eProsima FastDDS**, **Eclipse CycloneDDS**, **OCI OpenDDS** — ne
+sont pas utilisables comme backend actuellement parce qu'on n'a pas
+de Rust bindings vers eux. Il y a trois chemins viables si quelqu'un
+voulait les ajouter :
+
+- **Bindings FFI.** Wrapper l'API C du vendor. Lourd,
+  version-sensitive.
+- **Un processus sidecar.** Spawn les outils CLI du vendor
+  (`rtiddsspy`, `cyclonedds dump`) et parse leur output. Fragile mais
+  possible.
+- **Le backend RTPS sniff.** Une fois qu'il existe, tu n'as pas
+  besoin de code vendor-specific du tout pour observer leur trafic.
+
+La 3ᵉ option est le chemin qu'on prendrait long-terme, parce qu'elle
+résout le problème **pour tous les vendors à la fois** — RTPS est le
+standard wire.
+
+## Choisir un backend
+
+Actuellement : tu ne peux pas, RustDDS est le seul. Une fois HDDS en
+place, le choix sera à la compile (Cargo feature flag), et
+possiblement au runtime via un setting si les deux finissent dans le
+même binaire.
+
+Quand tu auras à choisir :
+
+- **Default → RustDDS** si tu inspectes un système ROS 2 ou une
+  application Rust DDS.
+- **HDDS** si tu veux du **décodage dynamique de types** sans
+  uploader manuellement des IDLs, ou si tu as besoin de parler avec
+  des cibles embedded qui utilisent le flavor `no_std` de HDDS.
+- **RTPS sniff** si tu veux observer un réseau où les publishers sont
+  RTI Connext / FastDDS / CycloneDDS / OpenDDS (ou n'importe quel
+  mix), et tu n'as pas besoin de publier toi-même.
+
+## Limites par backend
+
+| | RustDDS | HDDS (planifié) | RTPS sniff (planifié) |
+|---|---|---|---|
+| Discovery (SPDP/SEDP) | ✅ | ✅ | ✅ — en parsant les topics builtin |
+| S'abonner aux topics user | ✅ | ✅ | ✅ — read-only |
+| S'abonner aux topics builtin | ✅ via `BytesAdapter` | ✅ | ✅ |
+| **Publier** | ✅ (pas exposé dans l'UI encore) | ✅ planifié | ❌ by design |
+| XTypes / décodage dynamique de type | ❌ — besoin d'upload IDL (Phase 4) | ✅ natif | ⚠️ partiel — info de type seulement quand SEDP inclut TypeObject |
+| DDS Security | ✅ via feature `security` | ✅ DDS-Security 1.1 | ⚠️ peut observer mais pas décrypter les topics sécurisés |
+| Interop cross-vendor | ✅ testé vs RTI/Fast/Cyclone/OpenDDS | ✅ 48/48 tests OMG | ✅ — agnostique par construction |
+
+> Le chapitre suivant — **Glossaire** — donne un A→Z rapide de chaque
+> terme utilisé dans ces docs.

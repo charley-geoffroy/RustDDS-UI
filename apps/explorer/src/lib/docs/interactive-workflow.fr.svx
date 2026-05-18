@@ -1,0 +1,126 @@
+<script>
+  import WorkflowDiagram from "$lib/workflow/WorkflowDiagram.svelte";
+</script>
+
+# Interactif : une session pub/sub complète
+
+Avant de lire chaque protocole en détail, regarde-en un démarrer
+de bout en bout. Appuie sur **▶** ci-dessous pour passer à travers
+les cinq phases d'une vraie session DDS : idle → SPDP → SEDP →
+match → flowing.
+
+<WorkflowDiagram lang="fr" />
+
+## Ce que tu viens de voir
+
+Un mini réseau DDS avec trois participants :
+
+- **sensor-a** et **sensor-b** — chacun publie une mesure
+  `Temperature` sur le topic `/sensors/temp`. Ils écrivent avec des
+  *clés* différentes (`sensor_id = 42` et `43`), donc le même topic
+  porte deux instances indépendantes.
+- **dashboard** — s'abonne à `/sensors/temp` pour recevoir les deux.
+
+Les éléments cliquables ci-dessus t'apprennent un workflow DDS
+complet.
+
+### Idle (phase 0)
+
+Trois processus isolés. Ils ne se connaissent pas encore. Click
+n'importe quel participant pour voir son préfixe GUID, son vendor,
+et sa lease duration — l'information qui va bientôt voyager.
+
+### SPDP (phase 1) — la seule étape multicast
+
+Chaque participant diffuse une *auto-annonce* sur le groupe multicast
+well-known `239.255.0.1:7400` (le port est dérivé du domain ID via
+`7400 + 250 × domain_id`). Tous les autres participants du même
+domain écoutent ce groupe, donc en quelques secondes, **tout le monde
+connaît tout le monde**.
+
+Les lignes pointillées grises qui partent en éventail de chaque
+participant vers le bus — et reviennent — sont les paquets SPDP.
+Click sur le bus pour la formule du port et l'adresse multicast.
+
+→ En savoir plus : [chapitre Discovery](#docs/discovery).
+
+### SEDP (phase 2) — le gros du travail
+
+Une fois que les participants connaissent leurs locators unicast
+mutuels, ils échangent la liste de leurs `DataWriter`s et
+`DataReader`s sur quatre **topics builtin** dédiés :
+`DCPSPublication`, `DCPSSubscription`, `DCPSTopic`,
+`DCPSParticipantMessage`.
+
+Chaque annonce d'endpoint porte la QoS complète — c'est ce qui rend
+l'étape suivante possible.
+
+Les lignes bleues que tu vois dans cette phase sont des échanges
+SEDP unicast, en point-à-point direct entre participants. Plus de
+multicast.
+
+→ En savoir plus : [Les 5 topics builtin en détail](#docs/builtin-topics).
+
+### Match (phase 3) — le contrat
+
+Pour chaque paire (writer, reader) partageant un topic, le middleware
+vérifie la **compatibilité QoS**. Si les règles passent, la paire est
+*matchée* : un edge vert entre writer et reader, et les données sont
+prêtes à circuler.
+
+#### "Attends — plusieurs QoS sur le même topic ?"
+
+Oui. **La QoS vit sur l'endpoint, pas sur le topic.** Un topic porte
+une QoS *par défaut* dont héritent les writers et readers à leur
+création, mais chaque writer et chaque reader peut l'override. Donc
+sur `/sensors/temp` tu peux avoir :
+
+- **le writer de sensor-a** offrant Reliable + Volatile + KeepLast(10)
+- **le writer de sensor-b** offrant BestEffort + Volatile + KeepLast(1)
+- **le reader de dashboard** demandant Reliable + Volatile + KeepLast(10)
+
+Le middleware évalue alors **chaque paire (writer, reader)
+indépendamment** : dashboard ↔ sensor-a matche, dashboard ↔ sensor-b
+non (un writer BestEffort ne peut pas satisfaire un reader Reliable).
+Un edge vert, un edge rouge. Le QoS tinker sous le diagramme c'est
+exactement ça — une ligne par endpoint, trois policies que tu peux
+permuter, et la matrice se ré-évalue en temps réel.
+
+Essaie de mettre `sensor-a writer` à `BestEffort` en laissant
+`dashboard reader` à `Reliable` : l'edge vert devient rouge, avec la
+policy fautive nommée explicitement.
+
+→ En savoir plus : [QoS — le contrat de matching](#docs/qos).
+
+### Flowing (phase 4) — données sur le fil
+
+Les deux writers envoient des samples `Temperature`. Les flèches
+animées sur les edges matchés sont les samples en vol. Les labels
+ambre et teal à la destination te disent à quelle instance (quel
+`sensor_id`) ils appartiennent — c'est les topics WITH_KEY en action.
+
+Click sur l'edge vert pour le détail QoS côte à côte. Click n'importe
+quel participant ou endpoint chip pour voir ce qu'il sait de
+lui-même.
+
+→ En savoir plus : [Endpoints, GUIDs, instances](#docs/endpoints) et
+[Sérialisation — du hex au texte](#docs/cdr).
+
+## Où aller ensuite
+
+Tu as maintenant vu à quoi ressemble une session DDS de bout en bout.
+Les chapitres suivants zooment sur chaque phase :
+
+- **[Discovery](#docs/discovery)** — chaque détail de SPDP, SEDP, et
+  du mécanisme lease/liveliness.
+- **[Endpoints, GUIDs, instances](#docs/endpoints)** — les
+  identifiants 16-byte qui nomment chaque entité, et le concept
+  d'instance vu ci-dessus.
+- **[QoS — le contrat de matching](#docs/qos)** — chaque policy qui
+  compte et chaque piège courant.
+- **[Sérialisation — du hex au texte](#docs/cdr)** — ce qu'il y a
+  vraiment dans ces flèches qui circulent quand on décode les bytes.
+
+Le QoS tinker ci-dessus est à toi : reviens quand tu veux pour
+recréer un bug que tu as dans ta vraie app et voir pourquoi ça ne
+match pas.

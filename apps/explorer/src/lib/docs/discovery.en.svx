@@ -1,0 +1,152 @@
+# Discovery — how peers find each other
+
+DDS has no broker, no registry, no config file listing peers. A
+participant starts, joins a domain, and within a few seconds it knows
+who else is on the bus, what they publish, what they subscribe to,
+with which QoS.
+
+The mechanism is itself implemented as DDS topics — discovery flows
+through the same primitives as application data.
+
+## The three protocols
+
+| Phase | Protocol | Role | Transport |
+|---|---|---|---|
+| **0** — bootstrap | **SPDP** (Simple Participant Discovery) | "I exist, here's how to reach me" | UDP multicast |
+| **1** — endpoint exchange | **SEDP** (Simple Endpoint Discovery) | "These are my Writers and Readers" | UDP unicast (reliable) |
+| **2** — liveliness | **Liveliness assertion** | "I'm still alive" | UDP unicast |
+
+Phases 0 and 1 happen in sequence at startup. Phase 2 runs continuously
+afterwards.
+
+## Phase 0 — SPDP (multicast bootstrap)
+
+Every DomainParticipant periodically (≈ every 5 s by default) sends a
+**self-announcement** to a well-known multicast group, derived from the
+domain ID:
+
+```
+group  = 239.255.0.1               (IPv4 default)
+port   = 7400 + 250 × domain_id    (so domain 0 = port 7400)
+```
+
+The announcement carries:
+
+- The participant's **GuidPrefix** (12 bytes, see [Endpoints, GUIDs,
+  instances](#docs/endpoints))
+- Its **VendorId** — the 2 bytes that tell you which DDS implementation
+  is talking (this is what the Explorer's "Participants" pretty-prints
+  as `RustDDS`, `FastDDS`, etc.)
+- Its **locators** — the IP addresses and UDP ports where it can be
+  reached unicast
+- Its **lease duration** — how long peers should keep it "alive" without
+  hearing from it again
+- Optionally an `entity_name`
+
+Any participant in the same domain on the same LAN listens on the
+multicast group, so it receives every other participant's announcement
+within ≈ 5 s of starting up.
+
+That's it for multicast — it's only used for SPDP. Everything after is
+unicast.
+
+## Phase 1 — SEDP (the heavy-lifting)
+
+Once two participants know about each other (from SPDP), they exchange
+the list of their **DataWriters and DataReaders** over four dedicated
+builtin topics, called the **SEDP topics**:
+
+| Builtin topic | Type | Purpose |
+|---|---|---|
+| `DCPSPublication` | `DiscoveredWriterData` | "Here are my DataWriters" |
+| `DCPSSubscription` | `DiscoveredReaderData` | "Here are my DataReaders" |
+| `DCPSTopic` | `DiscoveredTopicData` | (Optional) topic-level metadata |
+
+Each endpoint announcement includes:
+
+- The endpoint's **GUID**
+- The **topic name** and **type name**
+- The full **QoS settings**
+- Optionally extra metadata (user_data, partition, etc.)
+
+This is read-and-cached: a participant subscribes to these builtin
+topics with Reliable + TransientLocal QoS, so even late joiners get the
+complete picture (every endpoint published before they joined still
+shows up via the TransientLocal cache).
+
+Once a participant sees a remote DataWriter on topic `Chatter` with QoS
+compatible with one of its local DataReaders on `Chatter`, it **matches**
+the pair and starts sending data the moment the user calls `write()`.
+
+## Phase 2 — Liveliness
+
+For matched endpoints with `Liveliness::Automatic` or
+`Liveliness::ManualByParticipant`, participants periodically write to
+the 5th builtin topic:
+
+| Builtin topic | Type | Purpose |
+|---|---|---|
+| `DCPSParticipantMessage` | `ParticipantMessageData` | "I'm still alive" |
+
+This is faster than the SPDP lease — typically every ≈ 1 s — and lets
+peers detect a crashed publisher quickly without waiting for the full
+lease to expire.
+
+If `Liveliness::ManualByTopic` is set, the application itself must call
+an `assert_liveliness()` API on each writer at the QoS-specified rate.
+
+## The 5 builtin topics in the sidebar
+
+If you expand **System** in the Explorer's sidebar you see all five:
+
+| Sidebar entry | Phase | Role |
+|---|---|---|
+| `DCPSParticipant` | 0 | SPDP — the multicast announcements |
+| `DCPSPublication` | 1 | SEDP — writer endpoints |
+| `DCPSSubscription` | 1 | SEDP — reader endpoints |
+| `DCPSTopic` | 1 | SEDP — optional topic metadata |
+| `DCPSParticipantMessage` | 2 | Liveliness pings |
+
+Each shows `1 writer · 1 reader` because **every participant** (including
+your own) has one Writer and one Reader on each of these topics. The
+sidebar reports your own builtin endpoints because loopback multicast
+sends SPDP back to you, and you discover yourself as if you were a
+remote peer — the protocol doesn't special-case self-discovery.
+
+Detailed payload structure for each one lives in [The 5 builtin topics,
+in detail](#docs/builtin-topics).
+
+## What you'll observe in the Explorer
+
+1. **Start the UI with no other DDS process running.** You see your own
+   participant under Participants and the 5 System topics, each with 1
+   writer and 1 reader. No User topics. This is the steady-state
+   "talking to yourself" view.
+2. **Start `pub-rustdds` in another terminal.** Within ≈ 2 s a
+   new entry appears under Participants (with `RustDDS` vendor and an
+   entity_name if one was set). The `Chatter` topic shows up under
+   User topics with `1 writer · 0 readers`.
+3. **Add `sub-rustdds`.** A third participant appears, and
+   Chatter goes to `1 writer · 1 reader`.
+4. **Kill the publisher (Ctrl-C).** After ≈ 5–10 s (its SPDP lease), it
+   vanishes from Participants. Chatter goes back to `0 writer · 1 reader`
+   or disappears entirely if no endpoint remains.
+
+That timing — instantaneous on add, lagged on remove — is intrinsic to
+SPDP: discovery is opportunistic and lease-based, not handshake-based.
+
+## What breaks discovery
+
+- **No multicast.** SPDP needs UDP multicast on the LAN. In cloud
+  environments, Docker bridge networks, certain VPNs, and most WiFi
+  guest networks, multicast is blocked or unreliable. Workaround:
+  configure each peer with a static **peer list** so SPDP packets go
+  unicast to known addresses (most DDS libs support this).
+- **TTL too low.** Default multicast TTL is 1 — packets don't leave the
+  local subnet. Useless across routers.
+- **Different domain IDs.** Domain 0 and domain 1 are invisible to each
+  other on the same wire.
+- **Firewalls.** macOS prompts on first run; if denied, no traffic.
+
+> Next: **Endpoints, GUIDs, instances** decodes the 16-byte identifiers
+> you've been staring at all chapter.

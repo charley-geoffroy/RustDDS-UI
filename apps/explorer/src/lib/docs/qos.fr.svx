@@ -1,0 +1,155 @@
+# QoS — le contrat de matching
+
+> **TL;DR**
+> - La QoS est un **contrat** que le middleware enforce, pas un label.
+> - **Chaque writer et chaque reader a sa propre QoS.** Le topic ne
+>   porte que la *valeur par défaut*.
+> - Une paire match quand **writer offre ≥ ce que reader demande**.
+>   Plus strict est OK ; plus faible non.
+> - Les mismatches **échouent silencieusement** par défaut.
+
+## La règle unique
+
+Pour chaque paire `(writer, reader)` partageant un topic, le middleware
+vérifie chaque policy RxO ("Requested vs Offered") indépendamment :
+
+> La QoS **requested** d'un reader doit être **satisfaite** par la QoS
+> **offered** d'un writer pour que la paire match.
+
+"Satisfaite" veut dire stricter-ou-égal. Un writer `Reliable` satisfait
+un reader `BestEffort` (plus strict que demandé — OK). Un writer
+`BestEffort` ne satisfait *pas* un reader `Reliable` (plus faible que
+demandé — mismatch, aucune donnée ne circule).
+
+Tu peux voir cette règle tourner en live dans le [chapitre Interactive
+workflow](#docs/interactive-workflow).
+
+---
+
+## Reliability
+
+| Valeur | Sémantique |
+|---|---|
+| `BestEffort` | Envoie et oublie. Les paquets perdus restent perdus. Rapide, cheap. |
+| `Reliable` | Acquittement + retransmission jusqu'à confirmation du reader. |
+
+**Matrice de matching :**
+
+| Reader demande ↓ \ Writer offre → | `BestEffort` | `Reliable` |
+|:--|:--:|:--:|
+| `BestEffort` | ✓ | ✓ |
+| `Reliable`   | ✗ | ✓ |
+
+**Piège :** ROS 2 utilise `Reliable` par défaut sur la plupart des
+topics user. Un reader `BestEffort` (sorti d'un exemple de tutoriel)
+ne les verra pas — le piège inverse de ce que les gens attendent.
+
+## Durability
+
+Si les late joiners voient ce qui a été publié avant leur arrivée.
+
+| Valeur | Le reader voit |
+|---|---|
+| `Volatile` | Uniquement les samples écrits *après* son arrivée. |
+| `TransientLocal` | Plus ceux encore dans le cache local du writer (borné par `History`). |
+| `Transient` | Plus ceux gardés par un durability service (rarement supporté). |
+| `Persistent` | Plus ceux qui survivent aux reboots (rarement supporté). |
+
+**Matrice de matching :**
+
+| Reader demande ↓ \ Writer offre → | `Volatile` | `TransientLocal` | `Transient` | `Persistent` |
+|:--|:--:|:--:|:--:|:--:|
+| `Volatile`       | ✓ | ✓ | ✓ | ✓ |
+| `TransientLocal` | ✗ | ✓ | ✓ | ✓ |
+| `Transient`      | ✗ | ✗ | ✓ | ✓ |
+| `Persistent`     | ✗ | ✗ | ✗ | ✓ |
+
+**Piège :** "topic existe, pas de samples" sur une paire Reliable +
+Volatile où le writer n'a encore rien à écrire. Le premier sample
+écrit *après* que le reader apparaisse sera le premier reçu. Pour
+rejouer l'historique du writer à la connexion, demander
+`TransientLocal` côté reader.
+
+## History (local-only — pas d'impact matching)
+
+Combien de samples chaque writer/reader garde dans son propre cache.
+
+- `KeepLast(depth)` — cache jusqu'à `depth` par instance ; les plus
+  vieux dropent.
+- `KeepAll` — cache tout ; peut bloquer les writers si les ressources
+  sont bornées.
+
+Coopère avec Durability : un late reader `TransientLocal` reçoit
+jusqu'à `History.depth` samples passés du writer.
+
+## Deadline
+
+Temps max entre samples sur une instance de topic.
+
+**Règle :** deadline writer ≤ deadline reader (writer promet d'écrire
+au moins aussi souvent que le reader demande).
+
+## Liveliness
+
+Comment le writer signale "je suis vivant" : `Automatic` (le
+middleware le fait), `ManualByParticipant` (n'importe quel write
+compte), ou `ManualByTopic` (l'app doit appeler `assert_liveliness()`
+par writer).
+
+**Règle :** kind du writer doit être plus fort ou égal ;
+`lease_duration` writer ≤ reader.
+
+## Ownership
+
+Si un seul writer ou plusieurs peuvent écrire la même instance :
+`Shared` (tous interleavés) ou `Exclusive` (le plus haut strength
+gagne, failover en cas de perte).
+
+**Règle :** doit matcher exactement des deux côtés.
+
+---
+
+## Defaults
+
+Le backend du projet ship avec :
+
+```rust
+Reliability::Reliable { max_blocking_time: 100ms }
+Durability::Volatile
+History::KeepLast { depth: 100 }
+```
+
+Ça match ce que ROS 2 utilise pour ses topics par défaut, donc les
+subscribers de l'inspecteur se pairent avec eux sans config
+supplémentaire.
+
+---
+
+## Index complet des policies
+
+| Policy | Affecte | RxO\* |
+|---|---|---|
+| Reliability | Garantie de livraison | ✅ |
+| Durability | Replay pour late-joiners | ✅ |
+| History | Taille cache local | ❌ |
+| Deadline | Période max entre samples | ✅ |
+| Liveliness | Sémantique heartbeat | ✅ |
+| Ownership | Writers exclusifs vs partagés | ✅ |
+| Partition | Groupement logique string-based | ❌ |
+| DestinationOrder | Ordering par timestamp source/réception | ✅ |
+| LatencyBudget | Hint de latence pour l'impl | ✅ |
+| TimeBasedFilter | Throttling côté reader | ❌ |
+| Presentation | Sample sets cohérents / ordonnés | ✅ |
+| ResourceLimits | Cap sur mémoire cache | ❌ |
+| Lifespan | TTL sur les samples en cache | ❌ |
+| TransportPriority | Hint pour l'impl | ❌ |
+| UserData / TopicData / GroupData | Bytes opaques sur les endpoints | ❌ |
+| DataRepresentation | Sélection XCDR1 / XCDR2 | ✅ |
+| TypeConsistencyEnforcement | Strictness XTypes | ✅ |
+| WriterDataLifecycle / ReaderDataLifecycle | Auto-dispose | ❌ |
+
+\*RxO = a des règles de matching. Les autres sont local-only.
+
+> Prochain chapitre — **Endpoints, GUIDs, instances** — décode les
+> identifiants 16-byte et explique le concept d'*instance* sur lequel
+> Durability et History s'appuient tous les deux.

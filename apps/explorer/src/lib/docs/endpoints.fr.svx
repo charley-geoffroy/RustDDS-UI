@@ -1,0 +1,172 @@
+# Endpoints, GUIDs, instances
+
+Dans chaque conversation DDS il y a exactement trois identifiants qui
+valent la peine d'être compris : le **GuidPrefix** (le participant),
+l'**EntityId** (un writer ou reader dans ce participant), et la **clé**
+(une instance dans un topic). Ensemble, ils permettent d'attribuer
+sans ambiguïté n'importe quel sample sur le bus : *"cette séquence de
+bytes est un sample de `Chatter` écrit par le reader X du participant
+Y, pour l'instance K."*
+
+## Le GUID — 16 bytes qui nomment un endpoint
+
+Chaque DataWriter, DataReader et DomainParticipant a un **GUID**
+globalement unique de exactement 16 bytes :
+
+```
+┌─────────────────────────── GUID (16 bytes) ──────────────────────────┐
+│                           │                                          │
+│  GuidPrefix (12 bytes)    │  EntityId (4 bytes)                      │
+│  identifie le             │  identifie le writer/reader              │
+│  DomainParticipant        │  au sein du participant                  │
+│                           │                                          │
+└───────────────────────────┴──────────────────────────────────────────┘
+```
+
+Dans l'UI de cette app, les GUIDs sont affichés comme
+`prefixhex.entityhex` — douze bytes hex, un point, quatre bytes hex.
+Exemple : `0112a2b30000000a.00000003`.
+
+Le GuidPrefix est identique pour **toutes** les entités possédées par
+un seul participant — ses DataWriters, DataReaders, et le participant
+lui-même. Donc repérer un prefix de 12 bytes partagé te dit "ces
+endpoints vivent tous dans le même processus."
+
+## Anatomie du GuidPrefix
+
+Les 12 bytes du GuidPrefix ne sont pas aléatoires — ils sont
+structurés pour aider au debug :
+
+```
+┌─────────┬─────────┬─────────┬─────────┬─────────┬─────────┐
+│ vendor  │ host    │ app     │ instance counter (reste)    │
+│ (2)     │ (4)     │ (4)     │                             │
+└─────────┴─────────┴─────────┴─────────┴─────────┴─────────┘
+```
+
+Les différents vendors remplissent ça différemment, mais la plupart
+packent :
+
+- **2 bytes** — le vendor ID (le même qu'en SPDP)
+- **4 bytes** — un identifiant d'hôte (souvent un hash MAC/hostname/IP)
+- **4 bytes** — un identifiant de processus / application
+- **reste** — un compteur d'instance, randomisé ou séquentiel
+
+Tu n'as pas besoin de parser ça toi-même — l'Explorer montre la forme
+hex et c'est assez pour repérer les patterns ("ah, ces trois endpoints
+partagent un prefix, donc même processus").
+
+## Anatomie de l'EntityId
+
+Les 4 derniers bytes — l'EntityId — distinguent les endpoints **au
+sein** d'un participant :
+
+```
+┌─────────────────────┬─────────────────┐
+│ entity key (3)      │ entity kind (1) │
+└─────────────────────┴─────────────────┘
+```
+
+Le **entity kind** est un enum d'1 byte qui dit ce qu'est cette
+entité :
+
+| Hex | Signification |
+|---|---|
+| `0xc1` | Writer User-defined (KEYED) |
+| `0xc2` | Writer User-defined (NO KEY) |
+| `0xc4` | Reader User-defined (KEYED) |
+| `0xc7` | Reader User-defined (NO KEY) |
+| `0xc3`, `0xc6` | Writers/Readers builtin de discovery |
+| `0x01` | Le DomainParticipant lui-même |
+
+Donc le byte de fin de n'importe quel GUID dans l'onglet Endpoints de
+l'Explorer te dit immédiatement si tu regardes un writer ou un reader,
+avec ou sans clés. `…00000003` (finit en `03`) → c'est une entité
+DomainParticipant. `…000100c4` (finit en `c4`) → c'est un reader keyed.
+
+Les endpoints builtin (de discovery) ont des **EntityIds well-known**
+définis par la spec — par exemple le SPDP writer de chaque participant
+est à l'EntityId `0x000100c2`. Cette prévisibilité est ce qui rend la
+discovery initiale possible avant tout échange dynamique.
+
+## Instances — le 3ᵉ niveau
+
+DDS a un niveau de partition supplémentaire, utilisé uniquement pour
+les topics `WITH_KEY` : l'**instance**. Dans un seul topic, les samples
+sont groupés par leur **clé**. Chaque valeur unique de clé définit une
+instance, et DDS suit leurs cycles de vie séparément
+(alive, not-alive-disposed, not-alive-no-writers).
+
+```
+┌────────────────────────────── Topic : Chatter ─────────────────────────────┐
+│                                                                             │
+│  Instance key=42         │  Instance key=43         │  Instance key=99      │
+│  ┌─────┐ ┌─────┐ ┌─────┐ │  ┌─────┐ ┌─────┐ ┌─────┐ │  ┌─────┐              │
+│  │ s1  │ │ s2  │ │ s3  │ │  │ s1  │ │ s2  │ │ s3  │ │  │ s1  │              │
+│  └─────┘ └─────┘ └─────┘ │  └─────┘ └─────┘ └─────┘ │  └─────┘              │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+Dans le demo du projet, `Chatter` utilise `publisher_id: u32` comme
+clé, donc chaque processus publisher en cours est sa propre instance.
+Deux publishers sur le même topic produisent deux flux interleavés du
+point de vue du reader — et tu peux utiliser `take_instance(key)` pour
+lire les samples d'une seule source.
+
+Pour les topics `NO_KEY`, tout le topic est un seul gros flux — pas de
+concept d'instance qui s'applique. La plupart des topics ROS 2 sont
+NO_KEY.
+
+## Cycle de vie d'un endpoint
+
+La discovery suit les endpoints à travers une petite state machine :
+
+```
+                ┌──────────────────┐
+                │      pas vu      │
+                └─────────┬────────┘
+                          │ message SEDP reçu
+                          ▼
+                ┌──────────────────┐
+                │     detected     │
+                └─────────┬────────┘
+                          │ QoS-compatible avec un counterpart local
+                          ▼
+                ┌──────────────────┐
+                │     matched      │  ← les données circulent ici
+                └─────────┬────────┘
+                          │ le pair disparaît ou unmatch
+                          ▼
+                ┌──────────────────┐
+                │      lost        │
+                └──────────────────┘
+```
+
+L'Explorer n'expose pas `matched` séparément pour l'instant (Phase 3
+le fera, dans la matrice QoS). Ce que tu vois aujourd'hui est la
+transition **detected**/**lost** : endpoints qui apparaissent /
+disparaissent dans les compteurs de la sidebar et sous l'onglet
+Endpoints d'un topic.
+
+Un événement **lost** se déclenche quand :
+
+- La lease SPDP du participant distant expire (≈ 10 s de silence)
+- Le processus distant dispose explicitement son endpoint (Ctrl-C
+  gracieux dans les publishers bien élevés)
+
+## Dans l'Explorer
+
+| Ce que tu vois | Ce que ça signifie |
+|---|---|
+| Sidebar "Participants → `0112a2b3…`" | Les 4 premiers bytes du GuidPrefix |
+| Endpoints tab → writer GUID `…00000003` | EntityKind `03` = entité DomainParticipant |
+| Endpoints tab → writer GUID `…000100c2` | EntityKind `c2` = User Writer, NO_KEY |
+| Endpoints tab → writer GUID `…000100c1` | EntityKind `c1` = User Writer, WITH_KEY |
+| Topic `Chatter` → 1 writer · 2 readers | Une instance publiée par writer matché ; les readers peuvent avoir le state d'instance local qu'ils veulent |
+
+Click n'importe quel GUID dans l'onglet Endpoints pour le copier —
+utile quand tu grep des logs RustDDS ou Wireshark RTPS.
+
+> Prochain : **QoS — le contrat de matching** est là où la plupart des
+> bugs DDS subtils se cachent. Il mérite son propre chapitre.

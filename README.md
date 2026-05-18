@@ -1,9 +1,5 @@
 # Rust DDS UI
 
-> ✨ **Vibe-coded.** This is a small tool I built mostly to **explore the
-> concepts** behind DDS — pub/sub, QoS matching, discovery, CDR. Not a
-> production tool, just a friendly playground to poke at and learn from.
-
 A small desktop app to **poke at DDS networks** — built while exploring
 [DDS](https://www.dds-foundation.org/) and [RustDDS](https://github.com/Atostek/RustDDS).
 
@@ -13,6 +9,10 @@ Sits at the intersection of:
   explaining DDS, QoS matching, discovery, CDR serialization,
 - a **DDS explorer** — live topic list, sample inspector with hex view,
   QoS matrix, endpoint browser.
+
+> ✨ **Vibe-coded.** This is a small tool I built mostly to **explore the
+> concepts** behind DDS — pub/sub, QoS matching, discovery, CDR. Not a
+> production tool, just a friendly playground to poke at and learn from.
 
 ## Stack
 

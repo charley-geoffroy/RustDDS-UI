@@ -1,0 +1,98 @@
+# DDS, c'est quoi ?
+
+DDS — le **Data Distribution Service** — est un middleware
+publish/subscribe standardisé par l'OMG, pour des échanges de données
+temps-réel décentralisés entre machines. En une phrase : **un bus de
+messages typé et QoS-aware, sans broker**.
+
+Cette dernière partie mérite qu'on s'y attarde. La plupart des systèmes
+pub/sub que tu as utilisés routent les messages via un serveur central :
+brokers MQTT, clusters Kafka, RabbitMQ, NATS. DDS, non. Chaque processus
+est un pair de plein droit qui trouve les autres tout seul et leur
+envoie les données directement. L'absence de broker est *le* trait
+définissant de DDS, et elle conditionne tout le reste de son
+fonctionnement.
+
+## Le modèle mental
+
+| Concept | Ressemble à |
+|---|---|
+| **Domain** | Un bus logique numéroté (`0`, `1`, … jusqu'à 232). Deux processus sur le même domain se voient. Deux processus sur des domains différents sont invisibles l'un pour l'autre, même sur le même réseau. |
+| **Participant** | Un processus qui a rejoint un domain. |
+| **Topic** | Un canal typé et nommé. Strings, ints, structs, tout ce qui est `serde`-sérialisable. |
+| **DataWriter** | "Je publie des samples de type `T` sur le topic `X`." |
+| **DataReader** | "Je veux recevoir des samples de type `T` du topic `X`." |
+| **QoS** | Un contrat attaché aux writers et readers décrivant fiabilité, history, deadlines, etc. Les deux côtés doivent s'accorder, sinon ils ne matchent pas. |
+
+C'est tout. Discovery, matching, retransmission, déduplication — DDS
+fait tout ça sous le capot.
+
+## Comparé à ce que tu connais
+
+- **MQTT** a un broker ; DDS non. Les topics MQTT sont des strings avec
+  hiérarchie (wildcards `+`/`#`) ; les topics DDS sont des canaux typés
+  avec contrats.
+- **Kafka** est un log durable et ordonné : les producers append, les
+  consumers replay depuis des offsets. DDS est *live-first* : les
+  samples partent quand ils sont écrits. Certaines combinaisons QoS de
+  DDS approximent le comportement "replay" de Kafka
+  (`Durability::TransientLocal` + `History::KeepLast`), mais ce n'est
+  pas le défaut.
+- **gRPC / REST** sont request/response. DDS est one-way publish,
+  many-way subscribe. Il existe une spec séparée pour le
+  request/response sur DDS (DDS-RPC), mais le cœur reste pub/sub.
+- **ROS 1** avait son propre pub/sub avec un master node central.
+  **ROS 2** a abandonné ça et utilise DDS comme transport — c'est le
+  plus gros déploiement DDS visible aujourd'hui.
+
+## Le rôle de RTPS
+
+L'OMG standardise deux choses :
+
+1. **DDS** — l'API applicative (DomainParticipant, Topic, etc.)
+2. **DDSI-RTPS** — le protocole de fil (Real-Time Publish-Subscribe)
+
+Tu peux mélanger les vendors au niveau API uniquement via leurs APIs
+propriétaires (RTI Connext, eProsima FastDDS, OpenDDS, CycloneDDS,
+RustDDS, …), mais sur le fil ils parlent tous RTPS — c'est pour ça
+qu'un publisher d'un vendor peut parler avec un subscriber d'un autre.
+La fameuse "Shapes demo" existe précisément pour valider l'interop
+cross-vendor.
+
+Quand cette app lit un sample dans l'onglet **Samples**, ce qui arrive
+sur la socket est un sous-message DATA RTPS portant un payload encodé
+en CDR. Tu liras tout ça dans le [chapitre sur la sérialisation](#docs/cdr).
+
+## Où DDS est utilisé
+
+La liste se lit comme un annuaire des industries sensibles à la latence :
+
+- **Robotique** — chaque node ROS 2, robots mobiles, bras industriels.
+- **Aérospatial & défense** — radar, systèmes de mission, réseaux de
+  simulation.
+- **Véhicules autonomes** — bus perception, planning, contrôle sur les
+  stacks prototypes.
+- **Énergie** — télémétrie smart grid, SCADA.
+- **Contrôle aérien** — le cas d'usage original autour duquel la spec
+  a été conçue.
+- **Simulation** — simulateurs distribués multi-host (compatibles HLA).
+
+Fil rouge : des systèmes où un broker ne peut pas être le single
+point of failure, où les pairs doivent se trouver sur un réseau
+privé, et où rater un deadline coûte plus cher que dropper un byte.
+
+## En quoi DDS diffère des systèmes broker-based
+
+1. **La discovery est automatique.** Un nouveau participant met
+   quelques secondes à apprendre ses pairs. Une fois découverts, les
+   samples circulent avec un overhead quasi nul.
+2. **Les mismatches QoS échouent silencieusement.** Un reader
+   Reliable ne match pas un writer BestEffort. Les deux côtés sont
+   visibles dans l'inspecteur mais aucun sample n'arrive. Voir le
+   [chapitre QoS](#docs/qos).
+3. **Les topics sont typés au niveau middleware.** Un reader ne peut
+   pas s'abonner à un topic avec le mauvais type. Le nom du type
+   fait partie de l'identité du topic et voyage via la discovery.
+
+> Le prochain chapitre liste les objets DDS et mappe chacun à où il
+> apparaît dans l'**Explorer**.

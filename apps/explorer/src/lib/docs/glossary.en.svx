@@ -1,0 +1,178 @@
+# Glossary
+
+Short definitions for every term that appears across these docs. Most
+entries link back to the chapter where they're explained in depth.
+
+### Backend
+This project's name for a swappable DDS implementation. See
+[Backends](#docs/backends).
+
+### BestEffort
+A [Reliability](#docs/qos) QoS value: send once, no retransmission, no
+acknowledgement. Fast and lossy.
+
+### CDR
+**Common Data Representation** — the OMG-standardized wire format for
+DDS payloads. See [Serialization](#docs/cdr).
+
+### DataReader / DataWriter
+The objects that actually send and receive samples on a topic. See
+[The DDS objects](#docs/dds-objects).
+
+### DCPSParticipant, DCPSPublication, DCPSSubscription, DCPSTopic, DCPSParticipantMessage
+The five **builtin topics** every DomainParticipant maintains for
+discovery and liveliness. See [The 5 builtin topics in
+detail](#docs/builtin-topics).
+
+### Deadline
+QoS policy specifying max time between samples on a topic instance.
+
+### Discovery
+The process of participants finding each other and exchanging endpoint
+info without configuration. See [Discovery](#docs/discovery).
+
+### Domain
+A numbered logical bus. Two participants on the same domain can match
+their writers and readers; different domains are invisible to each
+other.
+
+### DomainParticipant
+The root DDS object representing a process's membership in a domain.
+
+### Durability
+A [QoS](#docs/qos) policy: whether late joiners receive samples written
+before they joined.
+
+### EntityId
+The last 4 bytes of a [GUID](#docs/endpoints) identifying a specific
+writer / reader within a participant.
+
+### GuidPrefix
+The first 12 bytes of a [GUID](#docs/endpoints), shared by all entities
+on the same DomainParticipant.
+
+### GUID
+**Globally Unique Identifier** — 16 bytes that uniquely name any
+DDS endpoint on the bus. See [Endpoints, GUIDs,
+instances](#docs/endpoints).
+
+### HDDS
+A pure-Rust DDS implementation by hdds-team. See
+[Backends](#docs/backends).
+
+### History
+Local-only QoS bounding how many samples each writer/reader keeps in
+its cache.
+
+### Instance
+A sub-stream within a WITH_KEY topic, distinguished by the key value.
+See [Endpoints, GUIDs, instances](#docs/endpoints).
+
+### Key
+A field (or group of fields) on a WITH_KEY topic's payload type used to
+identify which instance a sample belongs to.
+
+### Liveliness
+QoS policy + status event combo for "is the writer still alive?". See
+[QoS](#docs/qos).
+
+### Locator
+A `(transport, port, address)` triple advertised in SPDP describing how
+to reach a participant unicast.
+
+### Matching
+The middleware step where a local writer and a remote reader (or
+vice-versa) confirm topic + QoS compatibility and start exchanging data.
+
+### Multicast
+UDP one-to-many transport, used by SPDP for the bootstrap announcements.
+
+### NO_KEY
+A topic kind where the whole topic is a single sample stream (no
+instance partitioning).
+
+### OMG
+**Object Management Group** — the standards body publishing the DDS,
+RTPS, CDR, XTypes, and DDS-Security specifications.
+
+### Ownership
+QoS policy: whether one writer or many can write to the same instance.
+
+### Participant
+Short for [DomainParticipant](#docs/dds-objects).
+
+### PL_CDR
+**Parameter-List CDR** — a self-describing variant of CDR used by
+discovery payloads. Each field carries its own ID and length, so
+readers can skip unknown fields.
+
+### Publisher / Subscriber
+DDS objects that own DataWriters / DataReaders and hold default QoS.
+Mostly invisible in practice.
+
+### QoS
+**Quality of Service** — the typed contract attached to writers and
+readers. See [QoS — the matching contract](#docs/qos).
+
+### Reliability
+[QoS](#docs/qos) policy: BestEffort or Reliable.
+
+### RepresentationIdentifier
+The 2-byte header at the start of every CDR payload, telling decoders
+which CDR variant follows. See [Serialization](#docs/cdr).
+
+### rmw
+ROS Middleware abstraction layer — ROS 2's equivalent of this project's
+`DdsBackend` trait. See [ROS 2 on top of DDS](#docs/ros2).
+
+### ROS 2
+Robot Operating System 2 — the largest user-visible DDS deployment. See
+[ROS 2 on top of DDS](#docs/ros2).
+
+### RTPS
+**Real-Time Publish-Subscribe Protocol** — the OMG-standardized wire
+protocol DDS implementations speak. Independent from the DDS API.
+
+### RustDDS
+A pure-Rust DDS implementation by Atostek. This app's default backend.
+
+### Sample
+One value sent through a writer to a reader on a topic.
+
+### SEDP
+**Simple Endpoint Discovery Protocol** — the SPDP follow-up where
+participants exchange writer/reader info over the four
+`DCPSPublication`/`DCPSSubscription`/`DCPSTopic` builtin topics. See
+[Discovery](#docs/discovery).
+
+### SPDP
+**Simple Participant Discovery Protocol** — the multicast-based
+bootstrap where participants announce their existence. See
+[Discovery](#docs/discovery).
+
+### TopicKind
+WITH_KEY or NO_KEY. Part of a topic's identity.
+
+### TransientLocal
+A Durability QoS value: keep written samples in the writer's local
+cache so late joiners can replay them.
+
+### Vendor / VendorId
+A 2-byte identifier in SPDP saying which DDS implementation is talking.
+Pretty-printed in the Participants sidebar.
+
+### Volatile
+The default Durability — late joiners get nothing past.
+
+### WITH_KEY
+A topic kind where samples are grouped by a key field into independent
+instances.
+
+### XCDR2
+The newer CDR variant (added by the XTypes 1.x spec) supporting
+optional fields, mutable types, and forward/backward compatibility.
+
+### XTypes
+The OMG spec for dynamic type discovery, type evolution, and type
+compatibility checking over DDS. RustDDS has partial support; HDDS has
+full 1.3 support.

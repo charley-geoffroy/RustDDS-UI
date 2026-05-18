@@ -1,0 +1,146 @@
+# ROS 2 au-dessus de DDS
+
+ROS 2 a abandonné le master node central de ROS 1 et a reconstruit sa
+couche de communication sur DDS. Du point de vue d'un inspecteur DDS,
+un système ROS 2 est **juste un set de participants DDS de plus**,
+avec quelques conventions de nommage et un ou deux quirks à connaître.
+
+## Ce que ROS 2 garde vs invente
+
+| Concept | ROS 2 l'appelle | Objet DDS sous le capot |
+|---|---|---|
+| Node | "node" | Un DomainParticipant ou un sub-thread d'un (selon le rmw) |
+| Topic | "topic" | Un Topic avec un préfixe `rt/...` |
+| Publisher | "publisher" | Un DataWriter |
+| Subscriber | "subscription" | Un DataReader |
+| Service request/response | "service" | Deux topics avec préfixes `rq/...` et `rr/...` |
+| Action | "action" | Cinq topics (goal, cancel, status, result, feedback) |
+| Parameters | "parameters" | Un service plus un topic pour les events |
+| QoS profile | `SystemDefaultsQoS`, `SensorDataQoS`, … | Un bundle de policies QoS DDS |
+
+Dans l'Explorer, un système ROS 2 en cours apparaît comme :
+
+- Un ou plusieurs participants par `ros2 launch` (selon
+  l'implémentation rmw)
+- Des topics dont les noms commencent par `rt/` (real-time / pub-sub),
+  `rq/` (request), `rr/` (reply), `rs/` (status)
+- Des types nommés comme `std_msgs::msg::dds_::String_` — l'underscore
+  final est une convention ROS 2 pour désambiguïser les types générés
+
+## Conventions de nommage de topic
+
+Un topic ROS 2 `/chatter` dans le code utilisateur devient le topic
+DDS `rt/chatter`. Le préfixe le marque comme un topic real-time
+(pub/sub) ; le slash interne est préservé. Les topics ROS 2 internes
+cachés (parameters, logging) utilisent des double underscores :
+`rt/_/...`.
+
+Pour les services et actions :
+
+| Path ROS 2 | Nom de topic DDS |
+|---|---|
+| Request du service `/add_two_ints` | `rq/add_two_intsRequest` |
+| Reply du service `/add_two_ints` | `rr/add_two_intsReply` |
+| Goal de l'action `/fibonacci` | `rq/fibonacci/_action/send_goalRequest` |
+| Feedback de l'action `/fibonacci` | `rt/fibonacci/_action/feedback` |
+
+Si tu vois un topic nommé `rq/...Request` et un autre nommé
+`rr/...Reply` avec le même préfixe, tu regardes un service ROS 2.
+
+## Nommage des types
+
+Les messages ROS déclarés comme `std_msgs/msg/String` deviennent des
+types DDS `std_msgs::msg::dds_::String_`. La règle de transformation :
+
+- Slashes → `::`
+- Un namespace extra `::dds_::` inséré avant le leaf
+- Underscore final sur le nom leaf
+
+C'est moche mais mécanique. Une fois que tu connais le pattern, tu
+peux repérer le type de message ROS depuis le type DDS dans
+l'Explorer.
+
+## QoS profiles que ROS 2 utilise
+
+ROS 2 expose des **QoS profiles** — des bundles nommés qui se
+transforment en policies QoS DDS sous le capot :
+
+| Profile ROS | Reliability | Durability | History | Cas d'usage |
+|---|---|---|---|---|
+| `SystemDefaultsQoS` | Reliable | Volatile | KeepLast(10) | la plupart des topics user |
+| `SensorDataQoS` | BestEffort | Volatile | KeepLast(5) | lidar, caméra, IMU |
+| `ServicesDefaultQoS` | Reliable | Volatile | KeepLast(10) | request/reply |
+| `ParametersQoS` | Reliable | Volatile | KeepLast(1000) | parameter events |
+| `ParameterEventsQoS` | Reliable | Volatile | KeepLast(1000) | parameter events |
+
+La plupart des problèmes "topic existe, pas de samples" sur un réseau
+ROS 2 sont parce que le reader de l'inspecteur est configuré
+`BestEffort` et le publisher est `Reliable` (ou vice-versa). La QoS
+subscriber par défaut de cette app est Reliable + Volatile +
+KeepLast(100) — ça matche `SystemDefaultsQoS` out-of-the-box. Pour
+les topics SensorDataQoS, tu pourras avoir besoin de relax
+manuellement la QoS du reader de l'inspecteur (un setting futur).
+
+## rmw — l'abstraction côté ROS
+
+L'équivalent ROS 2 du trait `DdsBackend` de ce projet est **rmw**
+(l'abstraction ROS Middleware). Chaque implémentation DDS a son
+propre adaptateur rmw :
+
+| Package rmw | DDS sous-jacent |
+|---|---|
+| `rmw_cyclonedds_cpp` | Eclipse Cyclone DDS — défaut sur ROS Iron+ sur la plupart des distros |
+| `rmw_fastrtps_cpp` | eProsima FastDDS — était défaut sur ROS Foxy/Humble |
+| `rmw_connextdds` | RTI Connext — commercial |
+| `rmw_zenoh_cpp` | Eclipse Zenoh — remplaçant ROS expérimental, pas strictement DDS |
+
+Tu peux switcher de rmw avec `export
+RMW_IMPLEMENTATION=rmw_cyclonedds_cpp` avant de lancer ROS 2.
+L'inspecteur voit le rmw actif — le champ `vendor` sur Participants
+te dit quelle lib DDS parle.
+
+## Quirks à connaître
+
+1. **Tous les topics ROS 2 sont `NO_KEY`.** ROS n'utilise pas le
+   concept d'instance DDS. Donc même quand l'inspecteur de cette app
+   essaie WITH_KEY en premier (et fall back en NO_KEY), inspecter un
+   topic ROS finira toujours sur la branche NO_KEY.
+2. **Noms de participant** — les nodes ROS 2 settent leur
+   `entity_name` participant au nom de node, donc la section
+   Participants de la sidebar te donne les noms de node directement.
+   Si tu vois "`unnamed`" c'est probablement un processus DDS non-ROS.
+3. **Discovery storm au démarrage** — un `ros2 launch` d'une stack
+   importante peut créer des dizaines de participants en quelques
+   secondes. L'inspecteur va montrer une volée d'events
+   `dds:participant_added` ; c'est normal.
+4. **DDS-Security et SROS2 ROS 2** — quand SROS2 est activé, tu verras
+   des paramètres security-related dans SPDP et des topics de
+   discovery additionnels (ex. `DCPSParticipantsSecure`). L'inspecteur
+   les traite comme des topics user aujourd'hui ; Phase F+ ajoutera
+   un handling propre.
+
+## Première expérience ROS 2 suggérée
+
+Si tu as ROS 2 installé :
+
+```sh
+# Terminal 1
+ros2 run demo_nodes_cpp talker
+
+# Terminal 2 — ton inspecteur UI
+cd apps/explorer && pnpm tauri dev
+```
+
+Tu devrais voir :
+
+- Un nouveau participant nommé `talker` (ou unnamed selon la distro)
+- Un nouveau topic `rt/chatter` avec type
+  `std_msgs::msg::dds_::String_`
+- Des samples qui arrivent à 1 Hz ; en vue ASCII tu peux lire
+  `"Hello World: N"`
+
+C'est une inspection end-to-end complète d'un vrai publisher ROS 2
+sans aucun code ROS de ton côté — du pur DDS.
+
+> Prochain : **Dépannage** — le lookup symptôme-vers-diagnostic pour
+> quand ça ne marche pas.

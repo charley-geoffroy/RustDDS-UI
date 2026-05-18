@@ -1,0 +1,158 @@
+# Les objets DDS
+
+DDS est construit autour de cinq objets cœur. Une fois que tu sais ce
+que chacun fait et comment ils se relient, le reste de la spec tombe en
+place. Chaque implémentation DDS (RustDDS, HDDS, FastDDS, RTI Connext,
+…) expose les mêmes concepts — seule la syntaxe diffère.
+
+```
+                            ┌─────────────────────┐
+                            │  DomainParticipant  │  rejoint un domain numéroté
+                            └──────────┬──────────┘
+                  ┌────────────────────┼────────────────────┐
+                  │                    │                    │
+                  ▼                    ▼                    ▼
+            ┌──────────┐         ┌──────────┐         ┌──────────┐
+            │  Topic   │         │Publisher │         │Subscriber│
+            │ (typé)   │         │          │         │          │
+            └────┬─────┘         └────┬─────┘         └────┬─────┘
+                 │                    │                    │
+                 │              ┌─────▼──────┐       ┌─────▼──────┐
+                 ├─────────────▶│ DataWriter │       │ DataReader │◀───┤
+                 │              └────────────┘       └────────────┘    │
+                 └─────────────────────────────────────────────────────┘
+                              même Topic des deux côtés
+```
+
+Lis-le comme ça : un `DomainParticipant` possède un `Publisher` (et un
+`Subscriber`). Le Publisher possède un ou plusieurs `DataWriter`s.
+Chaque writer est lié à un `Topic`. Côté réception, le `Subscriber`
+possède des `DataReader`s liés au même `Topic`. **La discovery et le
+matching QoS** connectent un writer sur un participant à un reader sur
+un autre participant quand ils partagent topic name, type, et QoS
+compatibles.
+
+## DomainParticipant
+
+Ton point d'entrée. En créer un rejoint un **domain** logique (un
+nombre de 0 à 232) et démarre la machinerie de discovery en arrière-plan.
+
+```rust
+// Avec l'abstraction backend de ce projet :
+let (events_tx, _events_rx) = std::sync::mpsc::channel();
+let backend = RustDdsBackend::start(0, events_tx)?;
+```
+
+Derrière cette ligne, n'importe quelle implémentation DDS conforme :
+
+- Ouvre des sockets UDP bindés sur des ports dérivés du domain ID
+  (`7400 + 250 × domain_id` pour multicast sur domain 0).
+- Rejoint le groupe multicast SPDP well-known.
+- Spawn des DataReaders/DataWriters builtin internes sur les 5
+  [topics système](#docs/discovery) que tu vois dans la sidebar.
+- Démarre l'envoi d'annonces périodiques.
+
+Tu crées typiquement **un DomainParticipant par processus**. En créer
+plus est légal mais double chaque socket, chaque cache, chaque timer.
+
+Dans l'**Explorer**, ton propre DomainParticipant est la source des
+endpoints attachés aux topics System. Les participants distants
+apparaissent sous **Participants** dans la sidebar.
+
+## Topic
+
+Un `Topic` est le contrat typé pour un flux de samples. Il porte :
+
+- Un **nom** — identifiant string opaque (`Chatter`, `/cmd_vel`, etc.).
+- Un **type name** — string décrivant le schéma du payload (`Chatter`,
+  `geometry_msgs::msg::dds_::Twist_`).
+- Un **kind** — `WITH_KEY` ou `NO_KEY`. Les topics WITH_KEY multiplexent
+  plusieurs flux indépendants (appelés *instances*) distingués par un
+  champ clé ; les topics NO_KEY portent un seul flux.
+- Une **QoS par défaut** que les writers et readers héritent sauf
+  override.
+
+L'identité d'un topic est le triplet `(name, type_name, kind)`. Deux
+participants qui s'accordent sur ces trois éléments, c'est ce qui fait
+matcher leurs writers et readers.
+
+Dans l'**Explorer**, chaque entrée de la liste Topics montre le nom et
+le type. Survole les builtin (System) pour les tooltips expliquant
+leur rôle.
+
+## Publisher et Subscriber
+
+Conteneurs pour writers et readers. Ils tiennent une QoS par défaut
+partagée et une policy `Partition` qui scope quels writers/readers se
+voient.
+
+Ils ne sont pas exposés dans l'**Explorer** — ils n'apparaissent pas
+dans la discovery ; seuls les writers et readers qu'ils possèdent le
+sont.
+
+## DataWriter et DataReader
+
+Les objets qui font le boulot. Via le crate
+[`dds-backend`](#docs/backends) de ce projet, ça donne :
+
+```rust
+// Côté publication (n'importe quel backend qui implémente DdsBackend)
+let publisher = backend.create_typed_publisher::<Chatter>(
+    "Chatter", "Chatter",
+)?;
+publisher.write(Chatter { /* ... */ })?;
+
+// Côté subscription
+let mut subscriber = backend.create_typed_subscriber::<Chatter>(
+    "Chatter", "Chatter",
+)?;
+if let Some(sample) = subscriber.take_next(Duration::from_millis(500))? {
+    println!("reçu : {sample:?}");
+}
+```
+
+C'est exactement le code de `pub-rustdds` et
+`sub-rustdds`. Échange l'import du backend et tu obtiens
+`pub-hdds` / `-sub-hdds` — la signature du helper reste
+identique parce que les concepts sont les mêmes.
+
+Un `DataWriter<T>` est paramétré par le type de payload `T` et envoie
+des samples de ce type sur son topic. Un `DataReader<T>` désérialise
+les samples reçus vers `T`.
+
+L'inspecteur UI prend un chemin différent : il s'abonne à des **bytes
+bruts** via la méthode agnostique `spawn_raw_subscription` de
+`DdsBackend`, ce qui lui permet d'observer n'importe quel topic sans
+connaître le type à la compilation.
+
+Chaque writer et chaque reader a son **propre GUID** — un identifiant
+de 16 bytes qui le nomme uniquement sur le bus DDS. Les 12 premiers
+bytes sont le GuidPrefix (partagé avec toutes les entités du même
+participant) ; les 4 derniers sont l'EntityId. Le [chapitre Endpoints,
+GUIDs, instances](#docs/endpoints) les décompose.
+
+Dans l'**Explorer**, les writers et readers que tu vois dans les
+compteurs de la sidebar (`1↑ 1↓`) et dans l'onglet **Endpoints** d'un
+topic sont exactement ces objets.
+
+## Listeners et WaitSets
+
+La spec DDS définit deux façons d'être notifié qu'une donnée est
+arrivée : **Listeners** (callbacks) et **WaitSets** (blocking wait sur
+plusieurs conditions). Les implémentations Rust exposent souvent
+`mio::Source` ou `futures::Stream` à la place, plus naturels pour
+Rust. Les vendors C++ implémentent les APIs de spec directement.
+
+## Référence rapide
+
+| Objet | Où tu le vois dans l'Explorer |
+|---|---|
+| DomainParticipant | Section "Participants" de la sidebar (et le tien, implicite). |
+| Topic | Sections "User topics" et "System" de la sidebar. |
+| Publisher / Subscriber | Pas exposé — conteneurs internes. |
+| DataWriter | Détail topic → onglet "Endpoints" → Writers. Compteur `↑` sidebar. |
+| DataReader | Détail topic → onglet "Endpoints" → Readers. Compteur `↓` sidebar. |
+| QoS | Détail topic → onglet "QoS". Hérité du publisher/subscriber par défaut. |
+
+> Prochain : **Discovery — comment les pairs se trouvent** explique le
+> protocole qui transforme des participants isolés en un bus connecté.
