@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/dds-backend",
+    "crates/demo-msgs",
+    "examples/pub-rustdds",
+    "examples/sub-rustdds",
+    "examples/pub-hdds",
+    "examples/sub-hdds",
+    "apps/explorer/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+rustdds = "0.11"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+mio = { version = "0.8.5", features = ["net", "os-poll"] }
+ctrlc = "3"
+anyhow = "1"
+env_logger = "0.11"
+demo-msgs = { path = "crates/demo-msgs" }
+dds-backend = { path = "crates/dds-backend", default-features = false }
