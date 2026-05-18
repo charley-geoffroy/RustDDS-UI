@@ -1,0 +1,11 @@
+[package]
+name = "pub-hdds"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+demo-msgs.workspace = true
+dds-backend = { workspace = true, features = ["hdds-backend"] }
+ctrlc.workspace = true
+anyhow.workspace = true
+env_logger.workspace = true

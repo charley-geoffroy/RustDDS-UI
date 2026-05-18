@@ -1,0 +1,11 @@
+[package]
+name = "sub-rustdds"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+demo-msgs.workspace = true
+dds-backend = { workspace = true, features = ["rustdds-backend"] }
+ctrlc.workspace = true
+anyhow.workspace = true
+env_logger.workspace = true

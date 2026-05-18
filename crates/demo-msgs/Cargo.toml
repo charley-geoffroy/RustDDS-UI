@@ -1,0 +1,8 @@
+[package]
+name = "demo-msgs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rustdds.workspace = true
+serde.workspace = true
