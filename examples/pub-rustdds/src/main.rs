@@ -10,6 +10,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use dds_backend::metrics::{MatchEvent, MatchTable, PubMetrics};
 use dds_backend::rustdds::RustDdsBackend;
 use dds_backend::DdsBackend;
 use demo_msgs::{Chatter, DOMAIN_ID, TOPIC_NAME, TYPE_NAME};
@@ -30,6 +31,8 @@ fn main() -> Result<()> {
 
     let backend = RustDdsBackend::start(DOMAIN_ID, events_tx)?;
     let publisher = backend.create_typed_publisher::<Chatter>(TOPIC_NAME, TYPE_NAME)?;
+    let metrics = publisher.metrics().clone();
+    let matches = publisher.matches().clone();
 
     let publisher_id = std::process::id();
     let mut counter: u64 = 0;
@@ -39,6 +42,22 @@ fn main() -> Result<()> {
         RustDdsBackend::name(),
         RustDdsBackend::version(),
     );
+
+    // 1Hz heartbeat — prints stats + any match events queued since the
+    // previous tick (events get drained by `write()` and printed here so
+    // the library stays silent).
+    {
+        let metrics = metrics.clone();
+        let matches = matches.clone();
+        let stop = stop.clone();
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_secs(1));
+                print_match_events(&matches, &metrics);
+                println!("[stats] {}", metrics.snapshot().format_line());
+            }
+        });
+    }
 
     while !stop.load(Ordering::Relaxed) {
         let stamp_ns = SystemTime::now()
@@ -52,9 +71,31 @@ fn main() -> Result<()> {
             text: format!("hello #{counter}"),
         };
         publisher.write(msg)?;
-        println!("sent #{counter}");
         counter += 1;
         thread::sleep(Duration::from_secs(1));
     }
+
+    // Catch any trailing status events that arrived after the last write.
+    publisher.drain_status();
+    print_match_events(&matches, &metrics);
+
+    println!("\n[final] {}", publisher.report().to_json_pretty());
     Ok(())
+}
+
+fn print_match_events(matches: &MatchTable, metrics: &PubMetrics) {
+    let current_sent = metrics.sent();
+    for event in matches.drain_events() {
+        match event {
+            MatchEvent::Matched(s) => println!(
+                "[+match]   reader={} sent_at_match={}",
+                s.reader_guid, s.sent_at_match
+            ),
+            MatchEvent::Unmatched(s) => println!(
+                "[-unmatch] reader={} samples_during_match={}",
+                s.reader_guid,
+                s.samples_during(current_sent),
+            ),
+        }
+    }
 }

@@ -25,6 +25,8 @@ pub mod rustdds;
 #[cfg(feature = "hdds-backend")]
 pub mod hdds;
 
+pub mod metrics;
+
 // ============================================================================
 // Neutral DTOs — used by every backend, by the UI, and by the inspection
 // trait below. These map 1:1 onto JSON shipped to the webview.

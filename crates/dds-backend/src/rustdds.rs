@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use mio::{Events, Interest, Poll, Token};
@@ -24,11 +24,13 @@ use rustdds::with_key::{
     Sample,
 };
 use rustdds::{
-    DomainParticipant, DomainParticipantBuilder, DomainParticipantStatusEvent, Key, Keyed,
-    QosPolicies, QosPolicyBuilder, RepresentationIdentifier, StatusEvented, Topic, TopicKind,
+    DataWriterStatus, DomainParticipant, DomainParticipantBuilder, DomainParticipantStatusEvent,
+    Key, Keyed, QosPolicies, QosPolicyBuilder, RepresentationIdentifier, StatusEvented, Topic,
+    TopicKind,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+use super::metrics::{MatchTable, PubMetrics, PubReport};
 use super::{
     BackendEvent, BackendSample, DdsBackend, EndpointDto, ParticipantDto, TopicDto,
 };
@@ -103,7 +105,8 @@ pub fn default_inspector_qos() -> QosPolicies {
 }
 
 /// Thin wrapper around a RustDDS DataWriter that publishes typed
-/// samples on a WITH_KEY topic.
+/// samples on a WITH_KEY topic. Tracks per-call timing in `metrics` and
+/// per-reader match sessions in `matches`.
 pub struct TypedPublisher<T>
 where
     T: Keyed + Serialize + 'static,
@@ -111,6 +114,8 @@ where
 {
     writer: WithKeyDataWriter<T>,
     _topic: Topic,
+    metrics: Arc<PubMetrics>,
+    matches: Arc<MatchTable>,
 }
 
 impl<T> TypedPublisher<T>
@@ -119,9 +124,61 @@ where
     <T as Keyed>::K: Key,
 {
     pub fn write(&self, value: T) -> Result<()> {
-        self.writer
-            .write(value, None)
-            .map_err(|_| anyhow::anyhow!("write failed"))
+        self.drain_status();
+        let start = Instant::now();
+        let res = self.writer.write(value, None);
+        let elapsed_ns = start.elapsed().as_nanos() as u64;
+        match res {
+            Ok(()) => {
+                self.metrics.record_write(elapsed_ns);
+                Ok(())
+            }
+            Err(_) => {
+                self.metrics.record_error();
+                Err(anyhow::anyhow!("write failed"))
+            }
+        }
+    }
+
+    /// Pull any pending writer status events (PublicationMatched, etc.)
+    /// and update the match table. Called automatically before each
+    /// write — callers should invoke it once more at shutdown to catch
+    /// trailing events.
+    pub fn drain_status(&self) {
+        while let Some(event) = self.writer.try_recv_status() {
+            handle_writer_status(&self.matches, &self.metrics, event);
+        }
+    }
+
+    /// Shared handle to the publisher's metrics — clone and hand off to
+    /// a heartbeat / reporting thread.
+    pub fn metrics(&self) -> &Arc<PubMetrics> {
+        &self.metrics
+    }
+
+    /// Shared handle to the publisher's match table.
+    pub fn matches(&self) -> &Arc<MatchTable> {
+        &self.matches
+    }
+
+    /// Combined snapshot suitable for a final exit dump.
+    pub fn report(&self) -> PubReport {
+        PubReport {
+            metrics: self.metrics.snapshot(),
+            matches: self.matches.snapshot(),
+        }
+    }
+}
+
+fn handle_writer_status(matches: &MatchTable, metrics: &PubMetrics, event: DataWriterStatus) {
+    if let DataWriterStatus::PublicationMatched { current, reader, .. } = event {
+        let guid = guid_string(&reader);
+        let sent_now = metrics.sent();
+        if current.count_change() > 0 {
+            matches.on_matched(guid, sent_now);
+        } else if current.count_change() < 0 {
+            matches.on_unmatched(&guid, sent_now);
+        }
     }
 }
 
@@ -194,6 +251,8 @@ impl RustDdsBackend {
         Ok(TypedPublisher {
             writer,
             _topic: topic,
+            metrics: PubMetrics::new(),
+            matches: MatchTable::new(),
         })
     }
 
