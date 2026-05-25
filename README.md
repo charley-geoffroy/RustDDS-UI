@@ -67,6 +67,7 @@ recompiling. `--help` on either lists everything; the most useful ones:
 | `--history-depth <N>` | both | KeepLast depth (default `100`) |
 | `--domain <id>` | both | DDS domain (default `0`) |
 | `--topic <name>` | both | topic name (default `Chatter`) |
+| `--csv <path>` | both | append a per-second row with cumulative counters and rate/percentile snapshots. Rows are skipped during `--await-readers`/`--warmup` so the file is steady-state only |
 
 A clean bench invocation. Start sub first so it's listening; pub will
 wait for it to match before writing:
@@ -86,6 +87,37 @@ Without `--await-readers`, the pub's writer queue holds up to
 those buffered samples are delivered as a burst with stale `stamp_ns`,
 which inflates the latency histogram. `--await-readers` avoids that
 at the source.
+
+The `elapsed_s` field in `[stats]` / CSV / final JSON uses a
+monotonic `Instant`, so an NTP / DST jump to the wall clock during
+the run won't poison the rate calculation. The wire stamp (`stamp_ns`
+in the message) and `last_send_ns` in the JSON are still `SystemTime`
+nanos — those need to be comparable across processes.
+
+### Multiple publishers / subscribers
+
+The bench is single-binary but the sub already tracks per-publisher
+state keyed by the `publisher_id` field (which the pub sets to its
+PID). To stress with N pubs against one sub, just start them in
+parallel — each gets a unique `publisher_id`, and the sub's
+`streams[]` array in the final JSON lists per-pub `received` / `lost`
+/ counter ranges:
+
+```bash
+# Terminal 1
+cargo run --release -p sub-rustdds -- --duration 30 --warmup 5
+
+# Terminal 2
+for _ in 1 2 3 4; do
+    cargo run --release -p pub-rustdds -- \
+        --rate 250 --duration 30 --await-readers 1 &
+done
+wait
+```
+
+Multiple subs work the same way (each gets its own copy of every
+sample). Use `--csv` on each process to capture independent
+time-series.
 
 ### Reading the bench output
 

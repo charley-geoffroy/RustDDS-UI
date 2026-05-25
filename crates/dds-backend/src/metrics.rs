@@ -8,13 +8,19 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
 /// Concurrent, lock-free publisher counters.
+///
+/// `started_ns` is a SystemTime nanos timestamp for human-readable
+/// JSON. `started_at` is a monotonic `Instant` used for elapsed_s /
+/// rate so a wall-clock jump (NTP, manual time change) during the run
+/// doesn't poison the rate calculation.
 pub struct PubMetrics {
     started_ns: AtomicU64,
+    started_at: Mutex<Instant>,
     sent: AtomicU64,
     errors: AtomicU64,
     last_send_ns: AtomicU64,
@@ -26,6 +32,7 @@ impl PubMetrics {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             started_ns: AtomicU64::new(now_ns()),
+            started_at: Mutex::new(Instant::now()),
             sent: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             last_send_ns: AtomicU64::new(0),
@@ -39,6 +46,7 @@ impl PubMetrics {
     /// discovery / cold-cache effects.
     pub fn reset(&self) {
         self.started_ns.store(now_ns(), Ordering::Relaxed);
+        *self.started_at.lock().unwrap() = Instant::now();
         self.sent.store(0, Ordering::Relaxed);
         self.errors.store(0, Ordering::Relaxed);
         self.last_send_ns.store(0, Ordering::Relaxed);
@@ -68,9 +76,9 @@ impl PubMetrics {
     pub fn snapshot(&self) -> PubMetricsSnapshot {
         let now = now_ns();
         let started = self.started_ns.load(Ordering::Relaxed);
+        let elapsed_s = self.started_at.lock().unwrap().elapsed().as_secs_f64();
         let sent = self.sent.load(Ordering::Relaxed);
         let total_ns = self.write_ns_total.load(Ordering::Relaxed);
-        let elapsed_s = ((now.saturating_sub(started)) as f64) / 1e9;
         PubMetricsSnapshot {
             started_ns: started,
             now_ns: now,
@@ -472,6 +480,7 @@ struct StreamState {
 
 pub struct SubMetrics {
     started_ns: AtomicU64,
+    started_at: Mutex<Instant>,
     received: AtomicU64,
     /// Wire loss detected by counter gaps from the published stream.
     lost_wire: AtomicU64,
@@ -508,6 +517,7 @@ impl SubMetrics {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             started_ns: AtomicU64::new(now_ns()),
+            started_at: Mutex::new(Instant::now()),
             received: AtomicU64::new(0),
             lost_wire: AtomicU64::new(0),
             reordered: AtomicU64::new(0),
@@ -529,6 +539,7 @@ impl SubMetrics {
     /// start time. Used at the warmup boundary.
     pub fn reset(&self) {
         self.started_ns.store(now_ns(), Ordering::Relaxed);
+        *self.started_at.lock().unwrap() = Instant::now();
         self.received.store(0, Ordering::Relaxed);
         self.lost_wire.store(0, Ordering::Relaxed);
         self.reordered.store(0, Ordering::Relaxed);
@@ -627,11 +638,9 @@ impl SubMetrics {
     }
 
     pub fn snapshot(&self) -> SubMetricsSnapshot {
-        let now = now_ns();
-        let started = self.started_ns.load(Ordering::Relaxed);
+        let elapsed_s = self.started_at.lock().unwrap().elapsed().as_secs_f64();
         let received = self.received.load(Ordering::Relaxed);
         let lost_wire = self.lost_wire.load(Ordering::Relaxed);
-        let elapsed_s = ((now.saturating_sub(started)) as f64) / 1e9;
         let denom = received + lost_wire;
         let streams = self
             .streams

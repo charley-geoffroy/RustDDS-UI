@@ -2,6 +2,7 @@
 //! `dds-backend`. Mirror of `pub-rustdds` — flags for QoS, warmup,
 //! duration cap.
 
+use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -47,6 +48,12 @@ struct Cli {
     /// History KeepLast depth.
     #[arg(long, default_value_t = 100)]
     history_depth: i32,
+
+    /// Append a per-second CSV row to this file. Rows are skipped
+    /// during the warmup window so the file only contains
+    /// steady-state samples.
+    #[arg(long)]
+    csv: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -102,16 +109,54 @@ fn main() -> Result<()> {
         cli.warmup,
     );
 
+    // True once the warmup window has elapsed; gates CSV writes.
+    let measuring = Arc::new(AtomicBool::new(cli.warmup == 0));
+
     // 1 Hz heartbeat — stats + sparkline.
     {
         let metrics = metrics.clone();
         let stop = stop.clone();
+        let measuring = measuring.clone();
+        let csv_path = cli.csv.clone();
         thread::spawn(move || {
+            let mut csv = csv_path.as_ref().map(|p| {
+                let f = std::fs::File::create(p).expect("failed to open --csv file");
+                let mut w = std::io::BufWriter::new(f);
+                writeln!(
+                    w,
+                    "t_s,recv,lost_wire,lost_dds,reord,dup,clock_skew_skipped,\
+                     rate_per_s,lat_p50_us,lat_p95_us,lat_p99_us,lat_max_us"
+                )
+                .unwrap();
+                w
+            });
             while !stop.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_secs(1));
                 let snap = metrics.snapshot();
                 println!("[stats] {}", snap.format_line());
                 println!("{}", metrics.render_history());
+                if measuring.load(Ordering::Relaxed) {
+                    if let Some(w) = csv.as_mut() {
+                        let lat = &snap.latency;
+                        let _ = writeln!(
+                            w,
+                            "{:.3},{},{},{},{},{},{},{:.3},{},{},{},{}",
+                            snap.elapsed_s,
+                            snap.received,
+                            snap.lost_wire,
+                            snap.lost_dds_local,
+                            snap.reordered,
+                            snap.duplicates,
+                            snap.clock_skew_skipped,
+                            snap.rate_per_s,
+                            lat.p50_ns / 1_000,
+                            lat.p95_ns / 1_000,
+                            lat.p99_ns / 1_000,
+                            lat.max_ns / 1_000,
+                        );
+                        let _ = w.flush();
+                    }
+                }
             }
         });
     }
@@ -145,6 +190,7 @@ fn main() -> Result<()> {
                         // this sample.
                         metrics.reset();
                         warmed_up = true;
+                        measuring.store(true, Ordering::Relaxed);
                         eprintln!("[warmup] {} s elapsed — counters reset", cli.warmup);
                     }
                     metrics.on_sample(c.publisher_id, c.counter);

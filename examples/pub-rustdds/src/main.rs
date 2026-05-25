@@ -2,6 +2,7 @@
 //! `dds-backend`. Flags let you sweep rate, payload size, QoS, etc.
 //! without recompiling.
 
+use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -64,6 +65,12 @@ struct Cli {
     /// History KeepLast depth.
     #[arg(long, default_value_t = 100)]
     history_depth: i32,
+
+    /// Append a per-second CSV row to this file. Header is written on
+    /// open. Rows are skipped during `--await-readers` and `--warmup`
+    /// so the file only contains steady-state samples.
+    #[arg(long)]
+    csv: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -129,16 +136,46 @@ fn main() -> Result<()> {
         cli.warmup,
     );
 
+    // True once any await + warmup phases have passed. Used to gate
+    // CSV writes so the file only contains steady-state samples.
+    let measuring = Arc::new(AtomicBool::new(
+        cli.await_readers == 0 && cli.warmup == 0,
+    ));
+
     // 1 Hz heartbeat — stats + match events queued since the last tick.
     {
         let metrics = metrics.clone();
         let matches = matches.clone();
         let stop = stop.clone();
+        let measuring = measuring.clone();
+        let csv_path = cli.csv.clone();
         thread::spawn(move || {
+            let mut csv = csv_path.as_ref().map(|p| {
+                let f = std::fs::File::create(p).expect("failed to open --csv file");
+                let mut w = std::io::BufWriter::new(f);
+                writeln!(w, "t_s,sent,errors,rate_per_s,write_avg_us,write_max_us").unwrap();
+                w
+            });
             while !stop.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_secs(1));
                 print_match_events(&matches, &metrics);
-                println!("[stats] {}", metrics.snapshot().format_line());
+                let snap = metrics.snapshot();
+                println!("[stats] {}", snap.format_line());
+                if measuring.load(Ordering::Relaxed) {
+                    if let Some(w) = csv.as_mut() {
+                        let _ = writeln!(
+                            w,
+                            "{:.3},{},{},{:.3},{},{}",
+                            snap.elapsed_s,
+                            snap.sent,
+                            snap.errors,
+                            snap.rate_per_s,
+                            snap.write_ns_avg / 1_000,
+                            snap.write_ns_max / 1_000,
+                        );
+                        let _ = w.flush();
+                    }
+                }
             }
         });
     }
@@ -162,6 +199,9 @@ fn main() -> Result<()> {
         // Reset so the very first write is t=0 in the metrics.
         metrics.reset();
         matches.rebase_sent_counter();
+        if cli.warmup == 0 {
+            measuring.store(true, Ordering::Relaxed);
+        }
     }
 
     let period = (cli.rate > 0.0).then(|| Duration::from_secs_f64(1.0 / cli.rate));
@@ -198,6 +238,7 @@ fn main() -> Result<()> {
                     metrics.reset();
                     matches.rebase_sent_counter();
                     warmed_up = true;
+                    measuring.store(true, Ordering::Relaxed);
                     eprintln!("[warmup] {} s elapsed — counters reset", cli.warmup);
                 }
             }
