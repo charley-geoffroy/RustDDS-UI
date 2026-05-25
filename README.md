@@ -64,6 +64,32 @@ pub + sub pair without installing Rust on the host:
 docker compose -f docker/docker-compose.yml up --build
 ```
 
+### Running pub and sub separately
+
+The compose file declares two services (`pub` and `sub`); name the one
+you want:
+
+```bash
+# pub only
+docker compose -f docker/docker-compose.yml up --build pub
+
+# sub only (in another terminal, on the same host or any host
+# reachable by RTPS multicast)
+docker compose -f docker/docker-compose.yml up --build sub
+```
+
+Without Compose, build and run each image directly:
+
+```bash
+# build
+docker build -t ddsui-pub -f docker/Dockerfile --build-arg BIN_NAME=pub-rustdds .
+docker build -t ddsui-sub -f docker/Dockerfile --build-arg BIN_NAME=sub-rustdds .
+
+# run (host networking is required for RTPS multicast discovery)
+docker run --rm --network=host ddsui-pub
+docker run --rm --network=host ddsui-sub
+```
+
 Both containers use `network_mode: host` so RTPS multicast discovery
 works. The explorer is **not** containerized — see
 [INSTALL-linux.md](INSTALL-linux.md) for native install on Linux.
