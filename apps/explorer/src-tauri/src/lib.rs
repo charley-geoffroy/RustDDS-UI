@@ -1,3 +1,4 @@
+mod bench;
 mod dds_service;
 mod dto;
 mod registry;
@@ -57,6 +58,16 @@ fn unsubscribe_topic(
         .map_err(|e| format!("{e:#}"))
 }
 
+#[tauri::command]
+fn import_bench_csv(path: String) -> Result<bench::BenchReport, String> {
+    bench::import_bench_csv(std::path::Path::new(&path)).map_err(|e| format!("{e:#}"))
+}
+
+#[tauri::command]
+fn parse_bench_csv(content: String) -> Result<bench::BenchReport, String> {
+    bench::parse_bench_csv_str(&content).map_err(|e| format!("{e:#}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -74,7 +85,9 @@ pub fn run() {
             get_version,
             list_state,
             subscribe_topic,
-            unsubscribe_topic
+            unsubscribe_topic,
+            import_bench_csv,
+            parse_bench_csv
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

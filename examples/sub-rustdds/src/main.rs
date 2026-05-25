@@ -118,10 +118,23 @@ fn main() -> Result<()> {
         let stop = stop.clone();
         let measuring = measuring.clone();
         let csv_path = cli.csv.clone();
+        let csv_duration = cli.duration;
+        let csv_warmup = cli.warmup;
+        let csv_reliab = cli.reliability;
+        let csv_hist = cli.history_depth;
+        let csv_topic = cli.topic.clone();
+        let csv_domain = cli.domain;
         thread::spawn(move || {
             let mut csv = csv_path.as_ref().map(|p| {
                 let f = std::fs::File::create(p).expect("failed to open --csv file");
                 let mut w = std::io::BufWriter::new(f);
+                writeln!(
+                    w,
+                    "# config: kind=sub duration={} warmup={} reliability={:?} \
+                     history_depth={} topic={} domain={}",
+                    csv_duration, csv_warmup, csv_reliab, csv_hist, csv_topic, csv_domain,
+                )
+                .unwrap();
                 writeln!(
                     w,
                     "t_s,recv,lost_wire,lost_dds,reord,dup,clock_skew_skipped,\

@@ -149,10 +149,33 @@ fn main() -> Result<()> {
         let stop = stop.clone();
         let measuring = measuring.clone();
         let csv_path = cli.csv.clone();
+        // Captured into the thread for the CSV header (self-describing run config).
+        let csv_rate = cli.rate;
+        let csv_payload = cli.payload;
+        let csv_duration = cli.duration;
+        let csv_warmup = cli.warmup;
+        let csv_await = cli.await_readers;
+        let csv_reliab = cli.reliability;
+        let csv_hist = cli.history_depth;
+        let csv_topic = cli.topic.clone();
+        let csv_domain = cli.domain;
         thread::spawn(move || {
             let mut csv = csv_path.as_ref().map(|p| {
                 let f = std::fs::File::create(p).expect("failed to open --csv file");
                 let mut w = std::io::BufWriter::new(f);
+                // Self-describing header: a "# config: k=v k=v" line the
+                // explorer's bench viewer parses to know the run params
+                // (target rate, payload, QoS) so it can compare observed
+                // vs intended.
+                writeln!(
+                    w,
+                    "# config: kind=pub rate={} payload={} duration={} \
+                     warmup={} await_readers={} reliability={:?} \
+                     history_depth={} topic={} domain={}",
+                    csv_rate, csv_payload, csv_duration, csv_warmup,
+                    csv_await, csv_reliab, csv_hist, csv_topic, csv_domain,
+                )
+                .unwrap();
                 writeln!(w, "t_s,sent,errors,rate_per_s,write_avg_us,write_max_us").unwrap();
                 w
             });

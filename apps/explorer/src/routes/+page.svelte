@@ -13,6 +13,7 @@
   import TopicDetail from "$lib/TopicDetail.svelte";
   import EmptyState from "$lib/EmptyState.svelte";
   import DocsLayout from "$lib/DocsLayout.svelte";
+  import BenchView from "$lib/bench/BenchView.svelte";
   import { defaultChapter, DEFAULT_LANG, type Lang } from "$lib/docs/chapters";
 
   type VersionInfo = {
@@ -34,8 +35,8 @@
   let searchQuery = $state("");
   let unlisteners: UnlistenFn[] = [];
 
-  // Mode: explorer (default) or docs. Hash-synced.
-  type Mode = "explorer" | "docs";
+  // Mode: explorer (default), docs, or bench. Hash-synced.
+  type Mode = "explorer" | "docs" | "bench";
   let mode = $state<Mode>("explorer");
   let docSlug = $state<string>(defaultChapter().slug);
   let docLang = $state<Lang>(DEFAULT_LANG);
@@ -57,11 +58,16 @@
       const slug = h.slice("docs".length).replace(/^\/?/, "") || defaultChapter().slug;
       return { mode: "docs", slug };
     }
+    if (h.startsWith("bench")) {
+      return { mode: "bench", slug: defaultChapter().slug };
+    }
     return { mode: "explorer", slug: defaultChapter().slug };
   }
 
   function writeHash(m: Mode, slug: string) {
-    const target = m === "docs" ? `#docs/${slug}` : "";
+    let target = "";
+    if (m === "docs") target = `#docs/${slug}`;
+    else if (m === "bench") target = "#bench";
     if (window.location.hash !== target) {
       // Use replaceState to avoid spamming browser history.
       history.replaceState(null, "", target || window.location.pathname);
@@ -247,6 +253,18 @@
       </svg>
       <span>Docs</span>
     </button>
+    <button
+      role="tab"
+      aria-selected={mode === "bench"}
+      class:active={mode === "bench"}
+      onclick={() => switchMode("bench")}
+      title="Bench report (import a CSV from pub-rustdds / sub-rustdds)"
+    >
+      <svg viewBox="0 0 16 16" width="14" height="14" fill="currentColor" aria-hidden="true">
+        <path d="M1.5 1.75a.75.75 0 0 1 1.5 0v12.5h11.25a.75.75 0 0 1 0 1.5H2.25a.75.75 0 0 1-.75-.75V1.75Zm14.28 2.53-5.25 5.25a.75.75 0 0 1-1.06 0L7 7.06 4.28 9.78a.75.75 0 0 1-1.06-1.06l3.25-3.25a.75.75 0 0 1 1.06 0L10 7.94l4.72-4.72a.75.75 0 1 1 1.06 1.06Z"/>
+      </svg>
+      <span>Bench</span>
+    </button>
   </div>
 
   <div class="brand">
@@ -296,13 +314,15 @@
         <EmptyState {userTopicCount} />
       {/if}
     </section>
-  {:else}
+  {:else if mode === "docs"}
     <DocsLayout
       slug={docSlug}
       lang={docLang}
       onSlugChange={setDocSlug}
       onLangChange={setDocLang}
     />
+  {:else if mode === "bench"}
+    <BenchView />
   {/if}
 </main>
 
