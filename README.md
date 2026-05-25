@@ -27,6 +27,8 @@ Sits at the intersection of:
 - Node.js + `pnpm`
 - Tauri 2 system deps — see
   [tauri.app/start/prerequisites](https://tauri.app/start/prerequisites/)
+  (Linux users: [INSTALL-linux.md](INSTALL-linux.md) has the exact
+  apt/dnf/pacman commands)
 
 ## Run
 
@@ -45,6 +47,11 @@ in another terminal:
 cargo run -p pub-rustdds
 cargo run -p sub-rustdds
 ```
+
+The publisher prints a 1Hz `[stats]` heartbeat (sent count, effective
+rate, write-call timings), `[+match]/[-unmatch]` lines whenever a
+remote reader joins or leaves, and a final JSON report on Ctrl-C
+covering metrics and per-reader match sessions.
 
 Or any ROS 2 talker / DDS publisher on the same domain.
 
