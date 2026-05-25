@@ -1,0 +1,9 @@
+target/
+**/target/
+.git/
+.claude/
+apps/explorer/node_modules/
+apps/explorer/build/
+apps/explorer/.svelte-kit/
+**/*.log
+.DS_Store

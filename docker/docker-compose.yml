@@ -1,0 +1,34 @@
+# Run a pub + sub side by side, both on the host network so RTPS
+# multicast discovery just works.
+#
+#   docker compose -f docker/docker-compose.yml up --build
+#
+# `network_mode: host` is the important bit — bridge networks silently
+# break RTPS discovery (UDP multicast to 239.255.0.1 doesn't traverse
+# the bridge by default). Host networking sidesteps the whole class of
+# problem at the cost of sharing the host's port space.
+
+services:
+  pub:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        BIN_NAME: pub-rustdds
+    image: ddsui-pub:latest
+    network_mode: host
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+    restart: unless-stopped
+
+  sub:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        BIN_NAME: sub-rustdds
+    image: ddsui-sub:latest
+    network_mode: host
+    environment:
+      RUST_LOG: ${RUST_LOG:-info}
+    restart: unless-stopped

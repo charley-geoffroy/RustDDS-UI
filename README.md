@@ -48,6 +48,19 @@ cargo run -p sub-rustdds
 
 Or any ROS 2 talker / DDS publisher on the same domain.
 
+## Containers
+
+`pub-rustdds` and `sub-rustdds` ship as a single Dockerfile. To run a
+pub + sub pair without installing Rust on the host:
+
+```bash
+docker compose -f docker/docker-compose.yml up --build
+```
+
+Both containers use `network_mode: host` so RTPS multicast discovery
+works. The explorer is **not** containerized — see
+[INSTALL-linux.md](INSTALL-linux.md) for native install on Linux.
+
 ## Layout
 
 ```
