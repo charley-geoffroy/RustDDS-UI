@@ -48,12 +48,75 @@ cargo run -p pub-rustdds
 cargo run -p sub-rustdds
 ```
 
-The publisher prints a 1Hz `[stats]` heartbeat (sent count, effective
-rate, write-call timings), `[+match]/[-unmatch]` lines whenever a
-remote reader joins or leaves, and a final JSON report on Ctrl-C
-covering metrics and per-reader match sessions.
-
 Or any ROS 2 talker / DDS publisher on the same domain.
+
+### Reading the bench output
+
+Both demos run as plain CLIs, print a 1Hz heartbeat while alive, and
+dump a JSON report on Ctrl-C. The JSON is meant to be diff-friendly
+(`jq` works great).
+
+**Publisher** — `pub-rustdds`:
+
+```
+[+match]   reader=0112f8db…00000007 sent_at_match=3
+[stats] sent=42 (8.4/s) errs=0 write_avg=24µs write_max=47µs uptime=5.0s
+[-unmatch] reader=0112f8db…00000007 samples_during_match=39
+```
+
+- `[+match]/[-unmatch]` — fires the moment a remote reader joins or
+  leaves the writer's match list. `sent_at_match` / `samples_during_match`
+  let you tell "discovered me but received nothing" from "discovered
+  me and got N samples".
+- `[stats]` — sent count, effective rate, and the per-call
+  `writer.write()` duration (local serialize + queue, not E2E).
+- Final JSON includes `metrics` (the heartbeat fields) and `matches`
+  with full `open`/`closed` session history (per-reader GUID,
+  `first_matched_ns`, `sent_at_match`, etc.).
+
+**Subscriber** — `sub-rustdds`:
+
+```
+[stats] recv=42 lost_wire=0 (0.0%) lost_dds=0 reord=0 dup=0 lat p50=180µs p95=620µs max=4058µs rate=8.4/s uptime=5.0s
+  recv │█████████▇▇████████
+  lost │
+  lat  │█▄▂▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+```
+
+- `lost_wire` — samples missing as detected by counter gaps on the
+  `Chatter.counter` field. Late-join window (everything before the
+  first received counter) is **not** counted as loss.
+- `lost_dds` — samples the local DDS stack reported dropping via
+  `DataReaderStatus::SampleLost`. When `lost_wire ≠ lost_dds`, the
+  delta tells you *where* the loss happened (wire vs. local).
+- `reord` / `dup` — counter went backwards or repeated.
+- `lat p50/p95/max` — end-to-end latency from the `stamp_ns` field
+  the publisher sets at write time. Conservative (bucket upper-edge)
+  power-of-two estimates. Negative latencies (clock skew) are dropped
+  and counted in `clock_skew_skipped` in the final JSON.
+- The three sparkline rows are a rolling 60s history at 1s
+  resolution: `recv` count, `lost` count, `lat` max-per-bucket in µs.
+
+Final JSON adds `latency: { count, min/avg/max, p50/p95/p99 }` and a
+per-publisher `streams` array (`received`, `lost`, `last_counter`,
+`first_counter_seen`).
+
+### Forcing loss for demos
+
+On a single host with Reliable QoS you won't naturally see loss. Two
+easy ways to simulate it:
+
+```bash
+# 1. Kill the sub mid-stream — when it restarts it won't see the
+#    gap (Volatile durability means the pub already dropped those
+#    samples), so this only shows up if you pre-populate state.
+
+# 2. Throttle the loopback briefly (Linux only). pf on macOS has
+#    its own syntax — netem is the canonical tool.
+sudo tc qdisc add dev lo root netem loss 5%
+# run pub + sub, then:
+sudo tc qdisc del dev lo root
+```
 
 ## Containers
 
