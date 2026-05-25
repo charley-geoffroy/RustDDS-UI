@@ -60,23 +60,32 @@ recompiling. `--help` on either lists everything; the most useful ones:
 | `--rate <Hz>` | pub | publish rate (default `1`, `0` = flat-out) |
 | `--payload <bytes>` | pub | extra opaque bytes per message |
 | `--count <N>` | pub | stop after N samples |
+| `--await-readers <N>` | pub | block writes until N readers have matched (recommended for benches; avoids the catch-up burst of pre-match buffered samples) |
 | `--duration <s>` | both | stop after N seconds |
-| `--warmup <s>` | both | skip discovery / cold-cache effects — counters are zeroed at the boundary |
+| `--warmup <s>` | both | discard the first N seconds of measurement. Pub counts from first write; sub counts from the **first received sample** so the warmup naturally covers late discovery and any catch-up burst |
 | `--reliability <kind>` | both | `reliable` (default) or `best-effort` |
 | `--history-depth <N>` | both | KeepLast depth (default `100`) |
 | `--domain <id>` | both | DDS domain (default `0`) |
 | `--topic <name>` | both | topic name (default `Chatter`) |
 
-A typical bench invocation:
+A clean bench invocation. Start sub first so it's listening; pub will
+wait for it to match before writing:
 
 ```bash
-# 30 s run at 1 kHz with 1 KB payloads, first 5 s discarded.
-cargo run --release -p pub-rustdds -- \
-    --rate 1000 --payload 1024 --duration 30 --warmup 5
+# Terminal 1
 cargo run --release -p sub-rustdds -- --duration 30 --warmup 5
+
+# Terminal 2
+cargo run --release -p pub-rustdds -- \
+    --rate 1000 --payload 1024 --duration 30 --warmup 5 --await-readers 1
 ```
 
 Pub and sub must agree on `--reliability` and `--domain` for matching.
+Without `--await-readers`, the pub's writer queue holds up to
+`--history-depth` samples for any future reader; when one matches,
+those buffered samples are delivered as a burst with stale `stamp_ns`,
+which inflates the latency histogram. `--await-readers` avoids that
+at the source.
 
 ### Reading the bench output
 

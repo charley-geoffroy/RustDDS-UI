@@ -32,8 +32,16 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     duration: u64,
 
-    /// Discard the first N seconds of metrics. Samples are still sent
-    /// during this window — only the counters are zeroed at the end.
+    /// Block writes until at least N readers have matched. Eliminates
+    /// pre-match buffering on the writer side (which otherwise shows
+    /// up as a catch-up burst with stale stamps in subscriber metrics).
+    /// Recommended for bench runs; 0 = start writing immediately.
+    #[arg(long, default_value_t = 0)]
+    await_readers: usize,
+
+    /// Discard the first N seconds of metrics after writes begin —
+    /// counters are zeroed at the boundary. Samples are still sent
+    /// during this window.
     #[arg(long, default_value_t = 0)]
     warmup: u64,
 
@@ -108,7 +116,7 @@ fn main() -> Result<()> {
 
     println!(
         "[{} {}] publisher {publisher_id:08x} writing to '{}' on domain {} \
-         (rate={:.1}Hz payload={}B reliability={:?} duration={}s warmup={}s)",
+         (rate={:.1}Hz payload={}B reliability={:?} await_readers={} duration={}s warmup={}s)",
         RustDdsBackend::name(),
         RustDdsBackend::version(),
         cli.topic,
@@ -116,6 +124,7 @@ fn main() -> Result<()> {
         cli.rate,
         cli.payload,
         cli.reliability,
+        cli.await_readers,
         cli.duration,
         cli.warmup,
     );
@@ -132,6 +141,27 @@ fn main() -> Result<()> {
                 println!("[stats] {}", metrics.snapshot().format_line());
             }
         });
+    }
+
+    // Optionally block writes until enough readers have matched, so
+    // there's no pre-match buffer on the writer to flush as a burst.
+    if cli.await_readers > 0 {
+        eprintln!(
+            "[await] waiting for {} reader(s) to match before writing...",
+            cli.await_readers,
+        );
+        while !stop.load(Ordering::Relaxed) {
+            publisher.drain_status();
+            let open = matches.snapshot().open.len();
+            if open >= cli.await_readers {
+                eprintln!("[await] {} reader(s) matched — starting writes", open);
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        // Reset so the very first write is t=0 in the metrics.
+        metrics.reset();
+        matches.rebase_sent_counter();
     }
 
     let period = (cli.rate > 0.0).then(|| Duration::from_secs_f64(1.0 / cli.rate));

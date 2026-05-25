@@ -23,9 +23,12 @@ struct Cli {
     #[arg(long, default_value_t = 0)]
     duration: u64,
 
-    /// Discard the first N seconds of metrics. Samples are still
-    /// received during this window — only the counters are zeroed at
-    /// the end. Useful to skip discovery and cold-cache effects.
+    /// Discard the first N seconds of received samples *after the
+    /// first one arrives*, then zero the counters. Starting the
+    /// warmup clock from the first sample (not from process start)
+    /// makes it robust to late discovery and to catch-up bursts of
+    /// pre-match buffered samples that would otherwise contaminate
+    /// the latency histogram.
     #[arg(long, default_value_t = 0)]
     warmup: u64,
 
@@ -114,25 +117,36 @@ fn main() -> Result<()> {
     }
 
     let stop_at = (cli.duration > 0).then(|| Instant::now() + Duration::from_secs(cli.duration));
-    let warmup_at = (cli.warmup > 0).then(|| Instant::now() + Duration::from_secs(cli.warmup));
-    let mut warmed_up = warmup_at.is_none();
+    // Warmup is armed by the first received sample, not by process
+    // start — see the doc on `Cli::warmup`.
+    let mut warmup_until: Option<Instant> = None;
+    let mut warmed_up = cli.warmup == 0;
 
     while !stop.load(Ordering::Relaxed) {
         if matches!(stop_at, Some(d) if Instant::now() >= d) {
             break;
         }
-        if !warmed_up {
-            if let Some(deadline) = warmup_at {
-                if Instant::now() >= deadline {
-                    metrics.reset();
-                    warmed_up = true;
-                    eprintln!("[warmup] {} s elapsed — counters reset", cli.warmup);
-                }
-            }
-        }
         match subscriber.take_available(Duration::from_millis(500)) {
             Ok(batch) => {
                 for (c, recv_ns) in batch {
+                    if !warmed_up {
+                        let deadline = *warmup_until.get_or_insert_with(|| {
+                            eprintln!(
+                                "[discovery] first sample received — starting {} s warmup",
+                                cli.warmup,
+                            );
+                            Instant::now() + Duration::from_secs(cli.warmup)
+                        });
+                        if Instant::now() < deadline {
+                            continue; // drop in-warmup samples (incl. catch-up burst)
+                        }
+                        // Crossed the warmup boundary — wipe any state
+                        // from dropped samples and start measuring with
+                        // this sample.
+                        metrics.reset();
+                        warmed_up = true;
+                        eprintln!("[warmup] {} s elapsed — counters reset", cli.warmup);
+                    }
                     metrics.on_sample(c.publisher_id, c.counter);
                     metrics.record_latency(c.stamp_ns, recv_ns);
                 }
