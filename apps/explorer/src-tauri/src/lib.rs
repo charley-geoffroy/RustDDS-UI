@@ -68,6 +68,14 @@ fn parse_bench_csv(content: String) -> Result<bench::BenchReport, String> {
     bench::parse_bench_csv_str(&content).map_err(|e| format!("{e:#}"))
 }
 
+#[tauri::command]
+fn parse_bench_pair(
+    pub_content: String,
+    sub_content: String,
+) -> Result<bench::PairReport, String> {
+    bench::parse_bench_pair_str(&pub_content, &sub_content).map_err(|e| format!("{e:#}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -87,7 +95,8 @@ pub fn run() {
             subscribe_topic,
             unsubscribe_topic,
             import_bench_csv,
-            parse_bench_csv
+            parse_bench_csv,
+            parse_bench_pair
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -112,6 +112,38 @@ pub struct BenchReport {
     pub verdict: BenchVerdict,
 }
 
+/// Cross-side numbers for a pub+sub paired run. Both reports are
+/// post-warmup so counts and rates are directly comparable.
+#[derive(Serialize, Clone, Debug)]
+pub struct PairAnalysis {
+    pub pub_sent: u64,
+    pub sub_recv: u64,
+    pub sub_lost: u64,
+    /// `pub_sent - sub_recv - sub_lost`. Positive means there are
+    /// samples the pub sent that the sub never counted (usually
+    /// expected: sub's own warmup + tail after sub stopped).
+    pub delta: i64,
+    /// How big a delta is "expected" given the sub's warmup window
+    /// (which silently discards samples between first-receive and
+    /// the warmup boundary).
+    pub expected_warmup_discard: Option<u64>,
+    pub pub_rate: f64,
+    pub sub_rate: f64,
+    /// `|pub_rate - sub_rate| / pub_rate * 100`. Should be near zero
+    /// if the wire isn't saturated.
+    pub rate_diff_pct: f64,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct PairReport {
+    pub pub_report: BenchReport,
+    pub sub_report: BenchReport,
+    pub analysis: PairAnalysis,
+    /// Combined verdict — worst of pub.verdict, sub.verdict, and
+    /// pair-specific checks (rate match + delta sanity).
+    pub verdict: BenchVerdict,
+}
+
 // ============================================================================
 // Entry point
 // ============================================================================
@@ -119,6 +151,28 @@ pub struct BenchReport {
 pub fn import_bench_csv(path: &Path) -> Result<BenchReport> {
     let content = fs::read_to_string(path).with_context(|| format!("read {path:?}"))?;
     parse_bench_csv_str(&content)
+}
+
+/// Parse a (pub-csv, sub-csv) pair and compute the cross-side
+/// analysis: how many samples crossed the wire, what's the rate
+/// alignment, where did the missing samples likely go.
+pub fn parse_bench_pair_str(pub_csv: &str, sub_csv: &str) -> Result<PairReport> {
+    let pub_report = parse_bench_csv_str(pub_csv)?;
+    let sub_report = parse_bench_csv_str(sub_csv)?;
+    if pub_report.kind != BenchKind::Pub {
+        bail!("first argument must be a pub CSV (got kind={:?})", pub_report.kind);
+    }
+    if sub_report.kind != BenchKind::Sub {
+        bail!("second argument must be a sub CSV (got kind={:?})", sub_report.kind);
+    }
+    let analysis = analyze_pair(&pub_report, &sub_report);
+    let verdict = pair_verdict(&pub_report, &sub_report, &analysis);
+    Ok(PairReport {
+        pub_report,
+        sub_report,
+        analysis,
+        verdict,
+    })
 }
 
 /// Parse a CSV directly from an in-memory string. The front-end uses
@@ -505,6 +559,182 @@ fn compute_verdict(cfg: &BenchConfig, s: &BenchSummary) -> BenchVerdict {
     }
 }
 
+// ============================================================================
+// Pair analysis + combined verdict
+// ============================================================================
+
+fn analyze_pair(pub_r: &BenchReport, sub_r: &BenchReport) -> PairAnalysis {
+    let pub_sent = pub_r.summary.total_samples;
+    let sub_recv = sub_r.summary.total_samples;
+    let sub_lost = sub_r.summary.total_lost.unwrap_or(0);
+    let delta = pub_sent as i64 - sub_recv as i64 - sub_lost as i64;
+
+    let pub_rate = pub_r.summary.mean_rate;
+    let sub_rate = sub_r.summary.mean_rate;
+    let rate_diff_pct = if pub_rate > 0.0 {
+        ((pub_rate - sub_rate) / pub_rate * 100.0).abs()
+    } else {
+        0.0
+    };
+
+    // The sub silently discards samples during its warmup window —
+    // that's `sub_warmup_s * pub_rate` samples that pub *sent* but sub
+    // never counted. We surface this so the user can see if their
+    // delta is "expected warmup" vs "real loss".
+    let expected_warmup_discard = sub_r
+        .config
+        .warmup
+        .map(|w| (w as f64 * pub_rate).round() as u64);
+
+    PairAnalysis {
+        pub_sent,
+        sub_recv,
+        sub_lost,
+        delta,
+        expected_warmup_discard,
+        pub_rate,
+        sub_rate,
+        rate_diff_pct,
+    }
+}
+
+fn pair_verdict(
+    pub_r: &BenchReport,
+    sub_r: &BenchReport,
+    a: &PairAnalysis,
+) -> BenchVerdict {
+    // Start from the union of both individual verdicts, then add
+    // pair-specific checks.
+    let mut checks: Vec<VerdictCheck> = pub_r
+        .verdict
+        .checks
+        .iter()
+        .map(|c| VerdictCheck {
+            label: format!("[pub] {}", c.label),
+            ..c.clone()
+        })
+        .chain(sub_r.verdict.checks.iter().map(|c| VerdictCheck {
+            label: format!("[sub] {}", c.label),
+            ..c.clone()
+        }))
+        .collect();
+
+    // Rate alignment — if the sub couldn't keep up, its mean rate will
+    // sit below the pub's mean rate.
+    let rate_sev = if a.rate_diff_pct < 5.0 {
+        Severity::Ok
+    } else if a.rate_diff_pct < 15.0 {
+        Severity::Warn
+    } else {
+        Severity::Bad
+    };
+    let rate_explain = match rate_sev {
+        Severity::Ok => "Le pub et le sub vivent au même rythme — pas de congestion.".into(),
+        Severity::Warn => format!(
+            "Écart de {:.1}% entre les débits — le sub commence à traîner. Vérifie la charge \
+             du process consommateur ou réduis `--rate`.",
+            a.rate_diff_pct
+        ),
+        Severity::Bad => format!(
+            "Écart de {:.1}% entre les débits — le sub est saturé. Probable backpressure ou \
+             contention système.",
+            a.rate_diff_pct
+        ),
+    };
+    checks.push(VerdictCheck {
+        label: "[pair] Alignement débit".into(),
+        severity: rate_sev,
+        value: format!("pub {:.0}/s vs sub {:.0}/s", a.pub_rate, a.sub_rate),
+        explain: rate_explain,
+    });
+
+    // Delta sanity — compare `delta` to `expected_warmup_discard`.
+    // If delta is way bigger, samples got lost somewhere we can't
+    // explain. If delta is negative, sub somehow counted more than pub
+    // sent (shouldn't happen).
+    let (delta_sev, delta_explain) = if a.delta < 0 {
+        (
+            Severity::Bad,
+            format!(
+                "Delta négatif ({}). Le sub a comptabilisé plus de samples que le pub n'en a \
+                 envoyé — incohérence, vérifie que les deux CSV viennent bien du même run.",
+                a.delta
+            ),
+        )
+    } else if let Some(expected) = a.expected_warmup_discard {
+        let high = (expected as f64 * 1.5).max(50.0) as i64;
+        let very_high = (expected as f64 * 3.0).max(200.0) as i64;
+        if a.delta <= high {
+            (
+                Severity::Ok,
+                format!(
+                    "Delta de {} samples — cohérent avec la fenêtre de warmup du sub \
+                     (~{} samples discardés silencieusement) et le tail après que le sub se \
+                     soit arrêté.",
+                    a.delta, expected,
+                ),
+            )
+        } else if a.delta <= very_high {
+            (
+                Severity::Warn,
+                format!(
+                    "Delta de {} samples, plus que l'estimé de ~{} pour la fenêtre de warmup. \
+                     Le pub a peut-être continué à émettre longtemps après l'arrêt du sub, \
+                     ou il y a eu de la contention.",
+                    a.delta, expected,
+                ),
+            )
+        } else {
+            (
+                Severity::Bad,
+                format!(
+                    "Delta de {} samples, beaucoup plus que l'estimé de ~{} pour le warmup. \
+                     Il manque probablement des samples côté sub — vérifie la durée des deux \
+                     runs et les pertes individuelles.",
+                    a.delta, expected,
+                ),
+            )
+        }
+    } else {
+        (
+            Severity::Ok,
+            format!(
+                "Delta de {} samples. Pas de warmup côté sub donc impossible d'estimer le \
+                 discard attendu — le delta couvre principalement le tail (samples envoyés \
+                 après l'arrêt du sub).",
+                a.delta
+            ),
+        )
+    };
+    checks.push(VerdictCheck {
+        label: "[pair] Cohérence des comptes".into(),
+        severity: delta_sev,
+        value: format!(
+            "pub sent {} · sub recv {} · sub lost {} · delta {:+}",
+            a.pub_sent, a.sub_recv, a.sub_lost, a.delta
+        ),
+        explain: delta_explain,
+    });
+
+    let severity = checks
+        .iter()
+        .map(|c| c.severity)
+        .max()
+        .unwrap_or(Severity::Ok);
+    let headline = match severity {
+        Severity::Ok => "Pub et sub cohérents",
+        Severity::Warn => "Cohérents avec quelques alertes",
+        Severity::Bad => "Incohérences détectées",
+    }
+    .to_string();
+
+    BenchVerdict {
+        severity,
+        headline,
+        checks,
+    }
+}
+
 fn format_us(us: u64) -> String {
     if us < 1_000 {
         format!("{}µs", us)
@@ -593,6 +823,46 @@ mod tests {
         let outlier = r.verdict.checks.iter().find(|c| c.label == "Outlier max");
         assert!(outlier.is_some());
         assert_eq!(outlier.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn pair_analysis_healthy_run() {
+        // Pub at 1000Hz for ~3s, sub at 2s warmup with one fewer
+        // second of measurement (typical setup).
+        let p = pub_csv(
+            "1.0,1000,0,1000.0,15,40\n\
+             2.0,2000,0,1000.0,15,40\n\
+             3.0,3000,0,1000.0,15,40\n",
+        );
+        let s = sub_csv(
+            "1.0,1000,0,0,0,0,0,1000.0,196,393,786,1129\n\
+             2.0,2000,0,0,0,0,0,1000.0,196,393,786,1129\n",
+        );
+        let pair = parse_bench_pair_str(&p, &s).unwrap();
+        assert_eq!(pair.analysis.pub_sent, 3000);
+        assert_eq!(pair.analysis.sub_recv, 2000);
+        assert_eq!(pair.analysis.sub_lost, 0);
+        assert_eq!(pair.analysis.delta, 1000);
+        // sub.config.warmup=0 in sub_csv helper, so no warmup estimate.
+        assert_eq!(pair.analysis.expected_warmup_discard, Some(0));
+        // Rates match → Ok on alignment, but delta=1000 is way above
+        // the 0 warmup estimate → Bad on coherence.
+        let coh = pair
+            .verdict
+            .checks
+            .iter()
+            .find(|c| c.label.contains("Cohérence"))
+            .unwrap();
+        assert_eq!(coh.severity, Severity::Bad);
+    }
+
+    #[test]
+    fn pair_rejects_swapped_csvs() {
+        let p = pub_csv("1.0,1000,0,1000.0,15,40\n");
+        let s = sub_csv("1.0,1000,0,0,0,0,0,1000.0,196,393,786,1129\n");
+        // Swap arguments — should error.
+        let err = parse_bench_pair_str(&s, &p).unwrap_err();
+        assert!(err.to_string().contains("first argument must be a pub"));
     }
 
     #[test]

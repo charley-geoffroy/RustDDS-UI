@@ -76,6 +76,24 @@ export type BenchReport = {
   verdict: BenchVerdict;
 };
 
+export type PairAnalysis = {
+  pub_sent: number;
+  sub_recv: number;
+  sub_lost: number;
+  delta: number;
+  expected_warmup_discard: number | null;
+  pub_rate: number;
+  sub_rate: number;
+  rate_diff_pct: number;
+};
+
+export type PairReport = {
+  pub_report: BenchReport;
+  sub_report: BenchReport;
+  analysis: PairAnalysis;
+  verdict: BenchVerdict;
+};
+
 export function formatUs(us: number | null | undefined): string {
   if (us == null) return "—";
   if (us < 1_000) return `${us}µs`;
