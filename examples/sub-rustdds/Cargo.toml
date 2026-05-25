@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 demo-msgs.workspace = true
 dds-backend = { workspace = true, features = ["rustdds-backend"] }
+rustdds.workspace = true
 ctrlc.workspace = true
 anyhow.workspace = true
 env_logger.workspace = true
+clap.workspace = true

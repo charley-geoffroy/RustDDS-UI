@@ -50,11 +50,39 @@ cargo run -p sub-rustdds
 
 Or any ROS 2 talker / DDS publisher on the same domain.
 
+### Bench flags
+
+Both binaries take CLI flags so you can sweep parameters without
+recompiling. `--help` on either lists everything; the most useful ones:
+
+| flag | applies to | what it does |
+|---|---|---|
+| `--rate <Hz>` | pub | publish rate (default `1`, `0` = flat-out) |
+| `--payload <bytes>` | pub | extra opaque bytes per message |
+| `--count <N>` | pub | stop after N samples |
+| `--duration <s>` | both | stop after N seconds |
+| `--warmup <s>` | both | skip discovery / cold-cache effects — counters are zeroed at the boundary |
+| `--reliability <kind>` | both | `reliable` (default) or `best-effort` |
+| `--history-depth <N>` | both | KeepLast depth (default `100`) |
+| `--domain <id>` | both | DDS domain (default `0`) |
+| `--topic <name>` | both | topic name (default `Chatter`) |
+
+A typical bench invocation:
+
+```bash
+# 30 s run at 1 kHz with 1 KB payloads, first 5 s discarded.
+cargo run --release -p pub-rustdds -- \
+    --rate 1000 --payload 1024 --duration 30 --warmup 5
+cargo run --release -p sub-rustdds -- --duration 30 --warmup 5
+```
+
+Pub and sub must agree on `--reliability` and `--domain` for matching.
+
 ### Reading the bench output
 
-Both demos run as plain CLIs, print a 1Hz heartbeat while alive, and
-dump a JSON report on Ctrl-C. The JSON is meant to be diff-friendly
-(`jq` works great).
+Both demos run as plain CLIs, print a 1 Hz heartbeat while alive, and
+dump a JSON report on Ctrl-C / `--duration` expiry. The JSON is meant
+to be diff-friendly (`jq` works great).
 
 **Publisher** — `pub-rustdds`:
 
@@ -90,9 +118,10 @@ dump a JSON report on Ctrl-C. The JSON is meant to be diff-friendly
   `DataReaderStatus::SampleLost`. When `lost_wire ≠ lost_dds`, the
   delta tells you *where* the loss happened (wire vs. local).
 - `reord` / `dup` — counter went backwards or repeated.
-- `lat p50/p95/max` — end-to-end latency from the `stamp_ns` field
-  the publisher sets at write time. Conservative (bucket upper-edge)
-  power-of-two estimates. Negative latencies (clock skew) are dropped
+- `lat p50/p95/max` — end-to-end latency from the `stamp_ns` field the
+  publisher sets at write time. Percentiles come from a log-2 bucket
+  histogram and are reported as the geometric mean of the matching
+  bucket (worst-case ±√2). Negative latencies (clock skew) are dropped
   and counted in `clock_skew_skipped` in the final JSON.
 - The three sparkline rows are a rolling 60s history at 1s
   resolution: `recv` count, `lost` count, `lat` max-per-bucket in µs.

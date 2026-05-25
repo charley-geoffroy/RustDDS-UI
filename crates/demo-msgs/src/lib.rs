@@ -11,6 +11,9 @@ pub struct Chatter {
     pub counter: u64,
     pub stamp_ns: u64,
     pub text: String,
+    /// Variable-size opaque bytes — lets the bench binaries grow the
+    /// on-wire payload without changing the schema. Empty by default.
+    pub padding: Vec<u8>,
 }
 
 impl Keyed for Chatter {

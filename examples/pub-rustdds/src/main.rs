@@ -1,22 +1,88 @@
-//! Publisher demo backed by the RustDDS implementation of `dds-backend`.
-//!
-//! To switch backend, change the two imports below to the equivalent
-//! HDDS / future-backend types — the rest of `main` stays identical.
+//! Publisher demo / bench backed by the RustDDS implementation of
+//! `dds-backend`. Flags let you sweep rate, payload size, QoS, etc.
+//! without recompiling.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use clap::{Parser, ValueEnum};
 use dds_backend::metrics::{MatchEvent, MatchTable, PubMetrics};
 use dds_backend::rustdds::RustDdsBackend;
 use dds_backend::DdsBackend;
 use demo_msgs::{Chatter, DOMAIN_ID, TOPIC_NAME, TYPE_NAME};
+use rustdds::policy::{Durability, History, Reliability};
+use rustdds::{QosPolicies, QosPolicyBuilder};
+
+#[derive(Parser, Debug)]
+#[command(about = "DDS publisher bench (RustDDS backend)")]
+struct Cli {
+    /// Publish rate in Hz. Set to 0 to publish flat-out with no sleep.
+    #[arg(long, default_value_t = 1.0)]
+    rate: f64,
+
+    /// Stop after this many samples (0 = unlimited).
+    #[arg(long, default_value_t = 0)]
+    count: u64,
+
+    /// Stop after this many seconds (0 = run until Ctrl-C).
+    #[arg(long, default_value_t = 0)]
+    duration: u64,
+
+    /// Discard the first N seconds of metrics. Samples are still sent
+    /// during this window — only the counters are zeroed at the end.
+    #[arg(long, default_value_t = 0)]
+    warmup: u64,
+
+    /// Extra opaque bytes appended to every message payload.
+    #[arg(long, default_value_t = 0)]
+    payload: usize,
+
+    /// DDS domain ID.
+    #[arg(long, default_value_t = DOMAIN_ID)]
+    domain: u16,
+
+    /// Topic name.
+    #[arg(long, default_value_t = TOPIC_NAME.to_string())]
+    topic: String,
+
+    /// Reliability QoS.
+    #[arg(long, value_enum, default_value_t = ReliabilityArg::Reliable)]
+    reliability: ReliabilityArg,
+
+    /// History KeepLast depth.
+    #[arg(long, default_value_t = 100)]
+    history_depth: i32,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ReliabilityArg {
+    Reliable,
+    BestEffort,
+}
+
+fn build_qos(cli: &Cli) -> QosPolicies {
+    let reliability = match cli.reliability {
+        ReliabilityArg::Reliable => Reliability::Reliable {
+            max_blocking_time: rustdds::Duration::from_millis(100),
+        },
+        ReliabilityArg::BestEffort => Reliability::BestEffort,
+    };
+    QosPolicyBuilder::new()
+        .reliability(reliability)
+        .durability(Durability::Volatile)
+        .history(History::KeepLast {
+            depth: cli.history_depth,
+        })
+        .build()
+}
 
 fn main() -> Result<()> {
     env_logger::init();
+    let cli = Cli::parse();
 
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -24,28 +90,37 @@ fn main() -> Result<()> {
         ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed))?;
     }
 
-    // Discovery events go to a channel we don't drain (the demo doesn't
-    // need them). They'll be silently dropped once it fills, which is OK
-    // for a small example. The inspector UI drains them properly.
-    let (events_tx, _events_rx) = mpsc::channel();
+    // Discovery events aren't needed; spawn a drainer so the unbounded
+    // channel doesn't leak.
+    let (events_tx, events_rx) = mpsc::channel();
+    thread::spawn(move || while events_rx.recv().is_ok() {});
 
-    let backend = RustDdsBackend::start(DOMAIN_ID, events_tx)?;
-    let publisher = backend.create_typed_publisher::<Chatter>(TOPIC_NAME, TYPE_NAME)?;
+    let backend = RustDdsBackend::start(cli.domain, events_tx)?;
+    let qos = build_qos(&cli);
+    let publisher =
+        backend.create_typed_publisher_with_qos::<Chatter>(&cli.topic, TYPE_NAME, qos)?;
     let metrics = publisher.metrics().clone();
     let matches = publisher.matches().clone();
 
     let publisher_id = std::process::id();
     let mut counter: u64 = 0;
+    let padding = vec![0u8; cli.payload];
 
     println!(
-        "[{} {}] publisher {publisher_id:08x} writing to '{TOPIC_NAME}' on domain {DOMAIN_ID} (Ctrl-C to stop)",
+        "[{} {}] publisher {publisher_id:08x} writing to '{}' on domain {} \
+         (rate={:.1}Hz payload={}B reliability={:?} duration={}s warmup={}s)",
         RustDdsBackend::name(),
         RustDdsBackend::version(),
+        cli.topic,
+        cli.domain,
+        cli.rate,
+        cli.payload,
+        cli.reliability,
+        cli.duration,
+        cli.warmup,
     );
 
-    // 1Hz heartbeat — prints stats + any match events queued since the
-    // previous tick (events get drained by `write()` and printed here so
-    // the library stays silent).
+    // 1 Hz heartbeat — stats + match events queued since the last tick.
     {
         let metrics = metrics.clone();
         let matches = matches.clone();
@@ -59,7 +134,20 @@ fn main() -> Result<()> {
         });
     }
 
+    let period = (cli.rate > 0.0).then(|| Duration::from_secs_f64(1.0 / cli.rate));
+    let mut next_deadline = Instant::now();
+    let stop_at = (cli.duration > 0).then(|| Instant::now() + Duration::from_secs(cli.duration));
+    let warmup_at = (cli.warmup > 0).then(|| Instant::now() + Duration::from_secs(cli.warmup));
+    let mut warmed_up = warmup_at.is_none();
+
     while !stop.load(Ordering::Relaxed) {
+        if matches!(stop_at, Some(d) if Instant::now() >= d) {
+            break;
+        }
+        if cli.count > 0 && counter >= cli.count {
+            break;
+        }
+
         let stamp_ns = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -69,13 +157,35 @@ fn main() -> Result<()> {
             counter,
             stamp_ns,
             text: format!("hello #{counter}"),
+            padding: padding.clone(),
         };
         publisher.write(msg)?;
         counter += 1;
-        thread::sleep(Duration::from_secs(1));
+
+        if !warmed_up {
+            if let Some(deadline) = warmup_at {
+                if Instant::now() >= deadline {
+                    metrics.reset();
+                    matches.rebase_sent_counter();
+                    warmed_up = true;
+                    eprintln!("[warmup] {} s elapsed — counters reset", cli.warmup);
+                }
+            }
+        }
+
+        if let Some(p) = period {
+            next_deadline += p;
+            let now = Instant::now();
+            if now < next_deadline {
+                thread::sleep(next_deadline - now);
+            } else {
+                // Fell behind — resync so the next sleep doesn't try to
+                // burn off accumulated debt all at once.
+                next_deadline = now;
+            }
+        }
     }
 
-    // Catch any trailing status events that arrived after the last write.
     publisher.drain_status();
     print_match_events(&matches, &metrics);
 

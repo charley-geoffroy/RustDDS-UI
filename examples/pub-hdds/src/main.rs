@@ -29,7 +29,8 @@ fn main() -> Result<()> {
         ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed))?;
     }
 
-    let (events_tx, _events_rx) = mpsc::channel();
+    let (events_tx, events_rx) = mpsc::channel();
+    thread::spawn(move || while events_rx.recv().is_ok() {});
     let backend = HddsBackend::start(DOMAIN_ID, events_tx)?;
     let publisher = backend.create_typed_publisher::<Chatter>(TOPIC_NAME, TYPE_NAME)?;
 
@@ -52,6 +53,7 @@ fn main() -> Result<()> {
             counter,
             stamp_ns,
             text: format!("hello #{counter}"),
+            padding: Vec::new(),
         };
         publisher.write(msg)?;
         println!("sent #{counter}");

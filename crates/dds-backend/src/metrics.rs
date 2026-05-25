@@ -14,7 +14,7 @@ use serde::Serialize;
 
 /// Concurrent, lock-free publisher counters.
 pub struct PubMetrics {
-    started_ns: u64,
+    started_ns: AtomicU64,
     sent: AtomicU64,
     errors: AtomicU64,
     last_send_ns: AtomicU64,
@@ -25,13 +25,25 @@ pub struct PubMetrics {
 impl PubMetrics {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            started_ns: now_ns(),
+            started_ns: AtomicU64::new(now_ns()),
             sent: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             last_send_ns: AtomicU64::new(0),
             write_ns_total: AtomicU64::new(0),
             write_ns_max: AtomicU64::new(0),
         })
+    }
+
+    /// Zero every counter and re-stamp the start time. Used at the
+    /// warmup boundary so steady-state numbers aren't polluted by
+    /// discovery / cold-cache effects.
+    pub fn reset(&self) {
+        self.started_ns.store(now_ns(), Ordering::Relaxed);
+        self.sent.store(0, Ordering::Relaxed);
+        self.errors.store(0, Ordering::Relaxed);
+        self.last_send_ns.store(0, Ordering::Relaxed);
+        self.write_ns_total.store(0, Ordering::Relaxed);
+        self.write_ns_max.store(0, Ordering::Relaxed);
     }
 
     /// Record a successful `write()` call along with how long it took
@@ -55,11 +67,12 @@ impl PubMetrics {
 
     pub fn snapshot(&self) -> PubMetricsSnapshot {
         let now = now_ns();
+        let started = self.started_ns.load(Ordering::Relaxed);
         let sent = self.sent.load(Ordering::Relaxed);
         let total_ns = self.write_ns_total.load(Ordering::Relaxed);
-        let elapsed_s = ((now.saturating_sub(self.started_ns)) as f64) / 1e9;
+        let elapsed_s = ((now.saturating_sub(started)) as f64) / 1e9;
         PubMetricsSnapshot {
-            started_ns: self.started_ns,
+            started_ns: started,
             now_ns: now,
             elapsed_s,
             sent,
@@ -200,6 +213,16 @@ impl MatchTable {
             closed: inner.closed.clone(),
         }
     }
+
+    /// Clamp every open session's `sent_at_match` to zero. Use right
+    /// after `PubMetrics::reset()` so `samples_during` still measures
+    /// "samples sent while matched" in the post-reset window.
+    pub fn rebase_sent_counter(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        for s in inner.open.values_mut() {
+            s.sent_at_match = 0;
+        }
+    }
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -247,6 +270,9 @@ const BUCKET_SECS: u64 = 1;
 
 /// 1-second resolution rolling histogram. Holds at most the last
 /// `HISTORY_CAP` buckets; older buckets are dropped as new ones open.
+///
+/// Time advancement is decoupled from recording so multiple buckets can
+/// share an axis — see `SubHistory::advance_to`.
 struct TimeBuckets {
     buckets: VecDeque<u64>,
     current_start_s: u64,
@@ -260,27 +286,23 @@ impl TimeBuckets {
         }
     }
 
-    fn record(&mut self, count: u64) {
-        self.advance();
-        if let Some(last) = self.buckets.back_mut() {
-            *last += count;
-        }
-    }
-
-    /// Like `record`, but tracks the max value seen in the current
-    /// bucket instead of summing. Used for the latency timeline.
-    fn record_max(&mut self, value: u64) {
-        self.advance();
-        if let Some(last) = self.buckets.back_mut() {
-            *last = (*last).max(value);
-        }
-    }
-
-    fn advance(&mut self) {
-        let now = now_s();
+    /// Advance the rolling window so the trailing bucket covers `now`.
+    /// Callers should advance all sibling buckets to the same `now`
+    /// before reading or writing to keep the rows time-aligned.
+    fn advance_to(&mut self, now: u64) {
         if self.buckets.is_empty() {
             self.current_start_s = now;
             self.buckets.push_back(0);
+            return;
+        }
+        // After a long quiet period, fast-forward instead of pushing
+        // thousands of empty buckets one at a time.
+        let gap = now.saturating_sub(self.current_start_s);
+        if gap > HISTORY_CAP as u64 {
+            self.buckets.clear();
+            self.current_start_s = now;
+            self.buckets.push_back(0);
+            return;
         }
         while now >= self.current_start_s + BUCKET_SECS {
             self.current_start_s += BUCKET_SECS;
@@ -289,6 +311,26 @@ impl TimeBuckets {
                 self.buckets.pop_front();
             }
         }
+    }
+
+    /// Add to the most recent bucket. Caller must have advanced first.
+    fn add_count(&mut self, count: u64) {
+        if let Some(last) = self.buckets.back_mut() {
+            *last += count;
+        }
+    }
+
+    /// Track the max value seen in the most recent bucket. Caller must
+    /// have advanced first.
+    fn add_max(&mut self, value: u64) {
+        if let Some(last) = self.buckets.back_mut() {
+            *last = (*last).max(value);
+        }
+    }
+
+    fn reset(&mut self) {
+        self.buckets.clear();
+        self.current_start_s = 0;
     }
 
     fn sparkline(&self) -> String {
@@ -319,8 +361,10 @@ const LAT_BUCKETS: usize = 40;
 
 /// Lock-free latency histogram. `record(ns)` is one atomic add per
 /// scalar (count/sum/min/max) plus one bucket bump. `snapshot()`
-/// computes percentiles from the buckets — accurate to ±50% (the
-/// bucket width), which is plenty for "is p95 1µs or 1ms?".
+/// computes percentiles from the buckets — reported as the geometric
+/// mean of the matching log-2 bucket, so the worst-case error is ±√2
+/// (about ±41%) instead of the 2× overestimate you'd get from the
+/// upper edge.
 pub struct LatencyHisto {
     count: AtomicU64,
     sum_ns: AtomicU64,
@@ -355,6 +399,16 @@ impl LatencyHisto {
         self.buckets[bucket.min(LAT_BUCKETS - 1)].fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn reset(&self) {
+        self.count.store(0, Ordering::Relaxed);
+        self.sum_ns.store(0, Ordering::Relaxed);
+        self.min_ns.store(u64::MAX, Ordering::Relaxed);
+        self.max_ns.store(0, Ordering::Relaxed);
+        for b in &self.buckets {
+            b.store(0, Ordering::Relaxed);
+        }
+    }
+
     pub fn snapshot(&self) -> LatencySnapshot {
         let count = self.count.load(Ordering::Relaxed);
         let sum = self.sum_ns.load(Ordering::Relaxed);
@@ -380,9 +434,12 @@ impl LatencyHisto {
         for (i, b) in self.buckets.iter().enumerate() {
             acc += b.load(Ordering::Relaxed);
             if acc >= threshold {
-                // Bucket i covers [2^i, 2^(i+1)) — report the upper edge
-                // as a conservative estimate.
-                return 1u64 << (i + 1).min(63);
+                // Bucket i covers [2^i, 2^(i+1)). Report the geometric
+                // mean (≈ lower * sqrt(2)) so the estimate sits in the
+                // middle of the bucket on a log scale, instead of
+                // systematically overshooting by 2× at the upper edge.
+                let lower = 1u64 << i.min(62);
+                return lower + (lower >> 1);
             }
         }
         self.max_ns.load(Ordering::Relaxed)
@@ -414,7 +471,7 @@ struct StreamState {
 }
 
 pub struct SubMetrics {
-    started_ns: u64,
+    started_ns: AtomicU64,
     received: AtomicU64,
     /// Wire loss detected by counter gaps from the published stream.
     lost_wire: AtomicU64,
@@ -437,10 +494,20 @@ struct SubHistory {
     lat_us: TimeBuckets,
 }
 
+impl SubHistory {
+    /// Advance all three rows to the same `now`, so the sparklines stay
+    /// time-aligned even when one signal is quiet.
+    fn advance_to(&mut self, now: u64) {
+        self.recv.advance_to(now);
+        self.lost.advance_to(now);
+        self.lat_us.advance_to(now);
+    }
+}
+
 impl SubMetrics {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            started_ns: now_ns(),
+            started_ns: AtomicU64::new(now_ns()),
             received: AtomicU64::new(0),
             lost_wire: AtomicU64::new(0),
             reordered: AtomicU64::new(0),
@@ -455,6 +522,25 @@ impl SubMetrics {
             }),
             latency: LatencyHisto::new(),
         })
+    }
+
+    /// Zero every counter, drop per-publisher state, clear the
+    /// sparkline buffers and the latency histogram, and re-stamp the
+    /// start time. Used at the warmup boundary.
+    pub fn reset(&self) {
+        self.started_ns.store(now_ns(), Ordering::Relaxed);
+        self.received.store(0, Ordering::Relaxed);
+        self.lost_wire.store(0, Ordering::Relaxed);
+        self.reordered.store(0, Ordering::Relaxed);
+        self.duplicates.store(0, Ordering::Relaxed);
+        self.lost_dds_local.store(0, Ordering::Relaxed);
+        self.clock_skew_skipped.store(0, Ordering::Relaxed);
+        self.streams.lock().unwrap().clear();
+        let mut h = self.history.lock().unwrap();
+        h.recv.reset();
+        h.lost.reset();
+        h.lat_us.reset();
+        self.latency.reset();
     }
 
     /// Record one received sample. `publisher_id` and `counter` come
@@ -475,7 +561,7 @@ impl SubMetrics {
             state.last_counter = counter;
             state.first_counter_seen = counter;
             self.received.fetch_add(1, Ordering::Relaxed);
-            self.history.lock().unwrap().recv.record(1);
+            self.bump_history(1, 0);
             return;
         }
 
@@ -483,7 +569,7 @@ impl SubMetrics {
             state.last_counter = counter;
             state.received += 1;
             self.received.fetch_add(1, Ordering::Relaxed);
-            self.history.lock().unwrap().recv.record(1);
+            self.bump_history(1, 0);
         } else if counter > state.last_counter + 1 {
             let gap = counter - state.last_counter - 1;
             state.lost += gap;
@@ -491,9 +577,7 @@ impl SubMetrics {
             state.received += 1;
             self.lost_wire.fetch_add(gap, Ordering::Relaxed);
             self.received.fetch_add(1, Ordering::Relaxed);
-            let mut h = self.history.lock().unwrap();
-            h.recv.record(1);
-            h.lost.record(gap);
+            self.bump_history(1, gap);
         } else if counter == state.last_counter {
             self.duplicates.fetch_add(1, Ordering::Relaxed);
         } else if counter < state.first_counter_seen {
@@ -502,9 +586,23 @@ impl SubMetrics {
             state.first_counter_seen = counter;
             state.received += 1;
             self.received.fetch_add(1, Ordering::Relaxed);
-            self.history.lock().unwrap().recv.record(1);
+            self.bump_history(1, 0);
         } else {
             self.reordered.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Update the recv / lost rows, keeping all three history rows
+    /// aligned to the same `now`.
+    fn bump_history(&self, recv: u64, lost: u64) {
+        let mut h = self.history.lock().unwrap();
+        let now = now_s();
+        h.advance_to(now);
+        if recv > 0 {
+            h.recv.add_count(recv);
+        }
+        if lost > 0 {
+            h.lost.add_count(lost);
         }
     }
 
@@ -523,14 +621,17 @@ impl SubMetrics {
         }
         let ns = recv_ns - stamp_ns;
         self.latency.record(ns);
-        self.history.lock().unwrap().lat_us.record_max(ns / 1_000);
+        let mut h = self.history.lock().unwrap();
+        h.advance_to(now_s());
+        h.lat_us.add_max(ns / 1_000);
     }
 
     pub fn snapshot(&self) -> SubMetricsSnapshot {
         let now = now_ns();
+        let started = self.started_ns.load(Ordering::Relaxed);
         let received = self.received.load(Ordering::Relaxed);
         let lost_wire = self.lost_wire.load(Ordering::Relaxed);
-        let elapsed_s = ((now.saturating_sub(self.started_ns)) as f64) / 1e9;
+        let elapsed_s = ((now.saturating_sub(started)) as f64) / 1e9;
         let denom = received + lost_wire;
         let streams = self
             .streams
@@ -562,8 +663,11 @@ impl SubMetrics {
 
     /// Render the recv / lost / latency history as a three-line ASCII
     /// sparkline. Latency row shows max-per-bucket in microseconds.
+    /// Advances all rows to "now" first so trailing quiet time shows
+    /// up as empty buckets on the right of every row.
     pub fn render_history(&self) -> String {
-        let h = self.history.lock().unwrap();
+        let mut h = self.history.lock().unwrap();
+        h.advance_to(now_s());
         format!(
             "  recv \u{2502}{}\n  lost \u{2502}{}\n  lat  \u{2502}{}",
             h.recv.sparkline(),

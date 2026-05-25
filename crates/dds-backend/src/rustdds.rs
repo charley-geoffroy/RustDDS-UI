@@ -133,9 +133,9 @@ where
                 self.metrics.record_write(elapsed_ns);
                 Ok(())
             }
-            Err(_) => {
+            Err(e) => {
                 self.metrics.record_error();
-                Err(anyhow::anyhow!("write failed"))
+                Err(anyhow::anyhow!("write failed: {e}"))
             }
         }
     }
@@ -205,6 +205,12 @@ where
     /// Wait up to `timeout` for the next sample. Returns `Ok(None)` on
     /// timeout. `Sample::Dispose` variants are surfaced as `Ok(None)` —
     /// callers that care about disposes should use the raw reader.
+    ///
+    /// Note: this only returns the *first* available sample. For
+    /// latency measurement, prefer [`take_available`] — returning one
+    /// sample per call leaves the rest queued, and the caller's stamp
+    /// of `recv_ns` then grows with queue depth instead of reflecting
+    /// the true wire-to-take time.
     pub fn take_next(&mut self, timeout: Duration) -> Result<Option<T>> {
         self.drain_status();
         let _ = self.poll.poll(&mut self.events, Some(timeout))?;
@@ -221,6 +227,32 @@ where
             }
         }
         Ok(None)
+    }
+
+    /// Wait up to `timeout` for a wakeup, then drain every sample
+    /// currently available from the reader. Each `(value, recv_ns)`
+    /// pair carries a timestamp captured right after the sample left
+    /// the reader queue, so end-to-end latency isn't inflated by call
+    /// overhead per queued sample.
+    pub fn take_available(&mut self, timeout: Duration) -> Result<Vec<(T, u64)>> {
+        self.drain_status();
+        let _ = self.poll.poll(&mut self.events, Some(timeout))?;
+        let mut out = Vec::new();
+        for _event in self.events.iter() {
+            loop {
+                match self.reader.take_next_sample() {
+                    Ok(Some(ds)) => {
+                        let recv_ns = now_ns();
+                        if let Sample::Value(v) = ds.into_value() {
+                            out.push((v, recv_ns));
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => return Err(anyhow::anyhow!("reader error: {e:?}")),
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Drain reader status events. Currently records
@@ -242,9 +274,10 @@ where
 }
 
 impl RustDdsBackend {
-    /// Create a typed publisher on a WITH_KEY topic. The topic is
-    /// (re-)declared locally with the given type name and the inspector
-    /// default QoS.
+    /// Create a typed publisher on a WITH_KEY topic with the inspector
+    /// default QoS (Reliable / Volatile / KeepLast 100). For bench-style
+    /// callers that need custom QoS use
+    /// [`Self::create_typed_publisher_with_qos`].
     pub fn create_typed_publisher<T>(
         &self,
         topic_name: &str,
@@ -254,7 +287,22 @@ impl RustDdsBackend {
         T: Keyed + Serialize + 'static,
         <T as Keyed>::K: Key,
     {
-        let qos = default_inspector_qos();
+        self.create_typed_publisher_with_qos(topic_name, type_name, default_inspector_qos())
+    }
+
+    /// Create a typed publisher on a WITH_KEY topic with the supplied
+    /// QoS. The same QoS is used to declare the topic, build the
+    /// publisher, and configure the writer.
+    pub fn create_typed_publisher_with_qos<T>(
+        &self,
+        topic_name: &str,
+        type_name: &str,
+        qos: QosPolicies,
+    ) -> Result<TypedPublisher<T>>
+    where
+        T: Keyed + Serialize + 'static,
+        <T as Keyed>::K: Key,
+    {
         let topic = self
             .dp
             .create_topic(
@@ -276,7 +324,8 @@ impl RustDdsBackend {
         })
     }
 
-    /// Create a typed subscriber on a WITH_KEY topic.
+    /// Create a typed subscriber on a WITH_KEY topic with the inspector
+    /// default QoS.
     pub fn create_typed_subscriber<T>(
         &self,
         topic_name: &str,
@@ -286,7 +335,21 @@ impl RustDdsBackend {
         T: Keyed + DeserializeOwned + 'static,
         <T as Keyed>::K: Key + DeserializeOwned,
     {
-        let qos = default_inspector_qos();
+        self.create_typed_subscriber_with_qos(topic_name, type_name, default_inspector_qos())
+    }
+
+    /// Create a typed subscriber on a WITH_KEY topic with the supplied
+    /// QoS.
+    pub fn create_typed_subscriber_with_qos<T>(
+        &self,
+        topic_name: &str,
+        type_name: &str,
+        qos: QosPolicies,
+    ) -> Result<TypedSubscriber<T>>
+    where
+        T: Keyed + DeserializeOwned + 'static,
+        <T as Keyed>::K: Key + DeserializeOwned,
+    {
         let topic = self
             .dp
             .create_topic(

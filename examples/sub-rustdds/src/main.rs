@@ -1,21 +1,76 @@
-//! Subscriber demo backed by the RustDDS implementation of `dds-backend`.
-//!
-//! Mirror of `pub-rustdds`: same pattern, swap backend by
-//! changing the two `dds_backend::...` imports.
+//! Subscriber demo / bench backed by the RustDDS implementation of
+//! `dds-backend`. Mirror of `pub-rustdds` — flags for QoS, warmup,
+//! duration cap.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use clap::{Parser, ValueEnum};
 use dds_backend::rustdds::RustDdsBackend;
 use dds_backend::DdsBackend;
 use demo_msgs::{Chatter, DOMAIN_ID, TOPIC_NAME, TYPE_NAME};
+use rustdds::policy::{Durability, History, Reliability};
+use rustdds::{QosPolicies, QosPolicyBuilder};
+
+#[derive(Parser, Debug)]
+#[command(about = "DDS subscriber bench (RustDDS backend)")]
+struct Cli {
+    /// Stop after this many seconds (0 = run until Ctrl-C).
+    #[arg(long, default_value_t = 0)]
+    duration: u64,
+
+    /// Discard the first N seconds of metrics. Samples are still
+    /// received during this window — only the counters are zeroed at
+    /// the end. Useful to skip discovery and cold-cache effects.
+    #[arg(long, default_value_t = 0)]
+    warmup: u64,
+
+    /// DDS domain ID.
+    #[arg(long, default_value_t = DOMAIN_ID)]
+    domain: u16,
+
+    /// Topic name.
+    #[arg(long, default_value_t = TOPIC_NAME.to_string())]
+    topic: String,
+
+    /// Reliability QoS.
+    #[arg(long, value_enum, default_value_t = ReliabilityArg::Reliable)]
+    reliability: ReliabilityArg,
+
+    /// History KeepLast depth.
+    #[arg(long, default_value_t = 100)]
+    history_depth: i32,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ReliabilityArg {
+    Reliable,
+    BestEffort,
+}
+
+fn build_qos(cli: &Cli) -> QosPolicies {
+    let reliability = match cli.reliability {
+        ReliabilityArg::Reliable => Reliability::Reliable {
+            max_blocking_time: rustdds::Duration::from_millis(100),
+        },
+        ReliabilityArg::BestEffort => Reliability::BestEffort,
+    };
+    QosPolicyBuilder::new()
+        .reliability(reliability)
+        .durability(Durability::Volatile)
+        .history(History::KeepLast {
+            depth: cli.history_depth,
+        })
+        .build()
+}
 
 fn main() -> Result<()> {
     env_logger::init();
+    let cli = Cli::parse();
 
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -23,20 +78,28 @@ fn main() -> Result<()> {
         ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed))?;
     }
 
-    let (events_tx, _events_rx) = mpsc::channel();
-    let backend = RustDdsBackend::start(DOMAIN_ID, events_tx)?;
-    let mut subscriber = backend.create_typed_subscriber::<Chatter>(TOPIC_NAME, TYPE_NAME)?;
+    let (events_tx, events_rx) = mpsc::channel();
+    thread::spawn(move || while events_rx.recv().is_ok() {});
+
+    let backend = RustDdsBackend::start(cli.domain, events_tx)?;
+    let qos = build_qos(&cli);
+    let mut subscriber =
+        backend.create_typed_subscriber_with_qos::<Chatter>(&cli.topic, TYPE_NAME, qos)?;
     let metrics = subscriber.metrics().clone();
 
     println!(
-        "[{} {}] subscriber listening on '{TOPIC_NAME}' on domain {DOMAIN_ID} (Ctrl-C to stop)",
+        "[{} {}] subscriber listening on '{}' on domain {} \
+         (reliability={:?} duration={}s warmup={}s)",
         RustDdsBackend::name(),
         RustDdsBackend::version(),
+        cli.topic,
+        cli.domain,
+        cli.reliability,
+        cli.duration,
+        cli.warmup,
     );
 
-    // 1Hz heartbeat: stats line + a fresh ASCII sparkline (60s window
-    // at 1s resolution). Sub-second jitter doesn't matter — the
-    // sparkline buckets are coarse.
+    // 1 Hz heartbeat — stats + sparkline.
     {
         let metrics = metrics.clone();
         let stop = stop.clone();
@@ -50,21 +113,34 @@ fn main() -> Result<()> {
         });
     }
 
+    let stop_at = (cli.duration > 0).then(|| Instant::now() + Duration::from_secs(cli.duration));
+    let warmup_at = (cli.warmup > 0).then(|| Instant::now() + Duration::from_secs(cli.warmup));
+    let mut warmed_up = warmup_at.is_none();
+
     while !stop.load(Ordering::Relaxed) {
-        match subscriber.take_next(Duration::from_millis(500)) {
-            Ok(Some(c)) => {
-                let recv_ns = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_nanos() as u64)
-                    .unwrap_or(0);
-                metrics.on_sample(c.publisher_id, c.counter);
-                metrics.record_latency(c.stamp_ns, recv_ns);
+        if matches!(stop_at, Some(d) if Instant::now() >= d) {
+            break;
+        }
+        if !warmed_up {
+            if let Some(deadline) = warmup_at {
+                if Instant::now() >= deadline {
+                    metrics.reset();
+                    warmed_up = true;
+                    eprintln!("[warmup] {} s elapsed — counters reset", cli.warmup);
+                }
             }
-            Ok(None) => continue,
+        }
+        match subscriber.take_available(Duration::from_millis(500)) {
+            Ok(batch) => {
+                for (c, recv_ns) in batch {
+                    metrics.on_sample(c.publisher_id, c.counter);
+                    metrics.record_latency(c.stamp_ns, recv_ns);
+                }
+            }
             // EINTR (Ctrl-C interrupting the poll) or any other reader
             // error — log and break so the final report still prints.
             Err(e) => {
-                eprintln!("[take_next ended] {e:?}");
+                eprintln!("[take_available ended] {e:?}");
                 break;
             }
         }

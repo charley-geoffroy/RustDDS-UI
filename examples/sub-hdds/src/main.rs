@@ -8,6 +8,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -24,7 +25,8 @@ fn main() -> Result<()> {
         ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed))?;
     }
 
-    let (events_tx, _events_rx) = mpsc::channel();
+    let (events_tx, events_rx) = mpsc::channel();
+    thread::spawn(move || while events_rx.recv().is_ok() {});
     let backend = HddsBackend::start(DOMAIN_ID, events_tx)?;
     let mut subscriber =
         backend.create_typed_subscriber::<Chatter>(TOPIC_NAME, TYPE_NAME)?;
