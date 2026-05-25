@@ -261,6 +261,22 @@ impl TimeBuckets {
     }
 
     fn record(&mut self, count: u64) {
+        self.advance();
+        if let Some(last) = self.buckets.back_mut() {
+            *last += count;
+        }
+    }
+
+    /// Like `record`, but tracks the max value seen in the current
+    /// bucket instead of summing. Used for the latency timeline.
+    fn record_max(&mut self, value: u64) {
+        self.advance();
+        if let Some(last) = self.buckets.back_mut() {
+            *last = (*last).max(value);
+        }
+    }
+
+    fn advance(&mut self) {
         let now = now_s();
         if self.buckets.is_empty() {
             self.current_start_s = now;
@@ -272,9 +288,6 @@ impl TimeBuckets {
             if self.buckets.len() > HISTORY_CAP {
                 self.buckets.pop_front();
             }
-        }
-        if let Some(last) = self.buckets.back_mut() {
-            *last += count;
         }
     }
 
@@ -293,6 +306,98 @@ impl TimeBuckets {
             })
             .collect()
     }
+}
+
+// ============================================================================
+// LatencyHisto — log-2 bucket histogram for end-to-end latency
+// ============================================================================
+
+/// Number of power-of-two buckets. Bucket `i` covers
+/// `[2^i, 2^(i+1))` nanoseconds, so 40 buckets reach ~18 minutes
+/// per sample — far beyond anything we'll ever see.
+const LAT_BUCKETS: usize = 40;
+
+/// Lock-free latency histogram. `record(ns)` is one atomic add per
+/// scalar (count/sum/min/max) plus one bucket bump. `snapshot()`
+/// computes percentiles from the buckets — accurate to ±50% (the
+/// bucket width), which is plenty for "is p95 1µs or 1ms?".
+pub struct LatencyHisto {
+    count: AtomicU64,
+    sum_ns: AtomicU64,
+    min_ns: AtomicU64,
+    max_ns: AtomicU64,
+    buckets: [AtomicU64; LAT_BUCKETS],
+}
+
+impl LatencyHisto {
+    pub fn new() -> Self {
+        const Z: AtomicU64 = AtomicU64::new(0);
+        Self {
+            count: AtomicU64::new(0),
+            sum_ns: AtomicU64::new(0),
+            min_ns: AtomicU64::new(u64::MAX),
+            max_ns: AtomicU64::new(0),
+            buckets: [Z; LAT_BUCKETS],
+        }
+    }
+
+    /// Record one latency sample. Caller is responsible for filtering
+    /// clock-skew (negative) cases; this method does nothing if `ns == 0`.
+    pub fn record(&self, ns: u64) {
+        if ns == 0 {
+            return;
+        }
+        self.count.fetch_add(1, Ordering::Relaxed);
+        self.sum_ns.fetch_add(ns, Ordering::Relaxed);
+        self.min_ns.fetch_min(ns, Ordering::Relaxed);
+        self.max_ns.fetch_max(ns, Ordering::Relaxed);
+        let bucket = (64u32 - ns.leading_zeros()).saturating_sub(1) as usize;
+        self.buckets[bucket.min(LAT_BUCKETS - 1)].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> LatencySnapshot {
+        let count = self.count.load(Ordering::Relaxed);
+        let sum = self.sum_ns.load(Ordering::Relaxed);
+        let max = self.max_ns.load(Ordering::Relaxed);
+        LatencySnapshot {
+            count,
+            min_ns: if count == 0 { 0 } else { self.min_ns.load(Ordering::Relaxed) },
+            avg_ns: if count > 0 { sum / count } else { 0 },
+            max_ns: max,
+            p50_ns: self.percentile(0.50),
+            p95_ns: self.percentile(0.95),
+            p99_ns: self.percentile(0.99),
+        }
+    }
+
+    fn percentile(&self, p: f64) -> u64 {
+        let total = self.count.load(Ordering::Relaxed);
+        if total == 0 {
+            return 0;
+        }
+        let threshold = ((total as f64) * p).ceil() as u64;
+        let mut acc = 0u64;
+        for (i, b) in self.buckets.iter().enumerate() {
+            acc += b.load(Ordering::Relaxed);
+            if acc >= threshold {
+                // Bucket i covers [2^i, 2^(i+1)) — report the upper edge
+                // as a conservative estimate.
+                return 1u64 << (i + 1).min(63);
+            }
+        }
+        self.max_ns.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct LatencySnapshot {
+    pub count: u64,
+    pub min_ns: u64,
+    pub avg_ns: u64,
+    pub max_ns: u64,
+    pub p50_ns: u64,
+    pub p95_ns: u64,
+    pub p99_ns: u64,
 }
 
 // ============================================================================
@@ -317,13 +422,19 @@ pub struct SubMetrics {
     duplicates: AtomicU64,
     /// Loss reported by the local DDS stack via `DataReaderStatus::SampleLost`.
     lost_dds_local: AtomicU64,
+    /// Samples where `recv_ns < stamp_ns` — clocks skewed, latency
+    /// would be negative, sample skipped from the histogram.
+    clock_skew_skipped: AtomicU64,
     streams: Mutex<HashMap<u32, StreamState>>,
     history: Mutex<SubHistory>,
+    latency: LatencyHisto,
 }
 
 struct SubHistory {
     recv: TimeBuckets,
     lost: TimeBuckets,
+    /// Max latency observed per bucket, in microseconds.
+    lat_us: TimeBuckets,
 }
 
 impl SubMetrics {
@@ -335,11 +446,14 @@ impl SubMetrics {
             reordered: AtomicU64::new(0),
             duplicates: AtomicU64::new(0),
             lost_dds_local: AtomicU64::new(0),
+            clock_skew_skipped: AtomicU64::new(0),
             streams: Mutex::new(HashMap::new()),
             history: Mutex::new(SubHistory {
                 recv: TimeBuckets::new(),
                 lost: TimeBuckets::new(),
+                lat_us: TimeBuckets::new(),
             }),
+            latency: LatencyHisto::new(),
         })
     }
 
@@ -398,6 +512,20 @@ impl SubMetrics {
         self.lost_dds_local.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Record one end-to-end latency observation. Pass `recv_ns` and
+    /// the `stamp_ns` the publisher embedded in the message. If clocks
+    /// are skewed (recv < stamp) the sample is counted in
+    /// `clock_skew_skipped` and dropped from the histogram.
+    pub fn record_latency(&self, stamp_ns: u64, recv_ns: u64) {
+        if recv_ns <= stamp_ns {
+            self.clock_skew_skipped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        let ns = recv_ns - stamp_ns;
+        self.latency.record(ns);
+        self.history.lock().unwrap().lat_us.record_max(ns / 1_000);
+    }
+
     pub fn snapshot(&self) -> SubMetricsSnapshot {
         let now = now_ns();
         let received = self.received.load(Ordering::Relaxed);
@@ -424,19 +552,23 @@ impl SubMetrics {
             lost_dds_local: self.lost_dds_local.load(Ordering::Relaxed),
             reordered: self.reordered.load(Ordering::Relaxed),
             duplicates: self.duplicates.load(Ordering::Relaxed),
+            clock_skew_skipped: self.clock_skew_skipped.load(Ordering::Relaxed),
             loss_rate: if denom > 0 { lost_wire as f64 / denom as f64 } else { 0.0 },
             rate_per_s: if elapsed_s > 0.0 { received as f64 / elapsed_s } else { 0.0 },
+            latency: self.latency.snapshot(),
             streams,
         }
     }
 
-    /// Render the recv / lost history as two-line ASCII sparkline.
+    /// Render the recv / lost / latency history as a three-line ASCII
+    /// sparkline. Latency row shows max-per-bucket in microseconds.
     pub fn render_history(&self) -> String {
         let h = self.history.lock().unwrap();
         format!(
-            "  recv \u{2502}{}\n  lost \u{2502}{}",
+            "  recv \u{2502}{}\n  lost \u{2502}{}\n  lat  \u{2502}{}",
             h.recv.sparkline(),
             h.lost.sparkline(),
+            h.lat_us.sparkline(),
         )
     }
 }
@@ -458,21 +590,35 @@ pub struct SubMetricsSnapshot {
     pub lost_dds_local: u64,
     pub reordered: u64,
     pub duplicates: u64,
+    pub clock_skew_skipped: u64,
     pub loss_rate: f64,
     pub rate_per_s: f64,
+    pub latency: LatencySnapshot,
     pub streams: Vec<StreamSnapshot>,
 }
 
 impl SubMetricsSnapshot {
     pub fn format_line(&self) -> String {
+        let lat = &self.latency;
+        let lat_str = if lat.count == 0 {
+            "lat=n/a".to_string()
+        } else {
+            format!(
+                "lat p50={}µs p95={}µs max={}µs",
+                lat.p50_ns / 1_000,
+                lat.p95_ns / 1_000,
+                lat.max_ns / 1_000,
+            )
+        };
         format!(
-            "recv={} lost_wire={} ({:.1}%) lost_dds={} reord={} dup={} rate={:.1}/s uptime={:.1}s",
+            "recv={} lost_wire={} ({:.1}%) lost_dds={} reord={} dup={} {} rate={:.1}/s uptime={:.1}s",
             self.received,
             self.lost_wire,
             self.loss_rate * 100.0,
             self.lost_dds_local,
             self.reordered,
             self.duplicates,
+            lat_str,
             self.rate_per_s,
             self.elapsed_s,
         )
@@ -539,6 +685,40 @@ mod tests {
         assert_eq!(s.received, 4);
         assert_eq!(s.lost_wire, 0);
         assert_eq!(s.reordered, 0);
+    }
+
+    #[test]
+    fn latency_histogram_basic() {
+        let h = LatencyHisto::new();
+        // 100 fast samples (1µs each)
+        for _ in 0..100 {
+            h.record(1_000);
+        }
+        // 5 slow samples (1ms each)
+        for _ in 0..5 {
+            h.record(1_000_000);
+        }
+        let s = h.snapshot();
+        assert_eq!(s.count, 105);
+        assert!(s.min_ns <= 1_000);
+        assert!(s.max_ns >= 1_000_000);
+        // p50 lands in the 1µs bucket (around 1-2µs)
+        assert!(s.p50_ns < 10_000, "p50 was {}ns", s.p50_ns);
+        // p99 lands in the 1ms bucket
+        assert!(s.p99_ns >= 524_288, "p99 was {}ns", s.p99_ns);
+    }
+
+    #[test]
+    fn clock_skew_is_skipped() {
+        let m = SubMetrics::new();
+        // recv before stamp → clocks skewed
+        m.record_latency(/* stamp */ 1000, /* recv */ 500);
+        // normal sample
+        m.record_latency(/* stamp */ 1000, /* recv */ 2000);
+        let s = m.snapshot();
+        assert_eq!(s.clock_skew_skipped, 1);
+        assert_eq!(s.latency.count, 1);
+        assert_eq!(s.latency.min_ns, 1000);
     }
 
     #[test]

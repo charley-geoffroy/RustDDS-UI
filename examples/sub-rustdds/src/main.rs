@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use dds_backend::rustdds::RustDdsBackend;
@@ -52,7 +52,14 @@ fn main() -> Result<()> {
 
     while !stop.load(Ordering::Relaxed) {
         match subscriber.take_next(Duration::from_millis(500)) {
-            Ok(Some(c)) => metrics.on_sample(c.publisher_id, c.counter),
+            Ok(Some(c)) => {
+                let recv_ns = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos() as u64)
+                    .unwrap_or(0);
+                metrics.on_sample(c.publisher_id, c.counter);
+                metrics.record_latency(c.stamp_ns, recv_ns);
+            }
             Ok(None) => continue,
             // EINTR (Ctrl-C interrupting the poll) or any other reader
             // error — log and break so the final report still prints.
