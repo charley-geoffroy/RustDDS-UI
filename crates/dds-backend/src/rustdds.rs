@@ -24,13 +24,13 @@ use rustdds::with_key::{
     Sample,
 };
 use rustdds::{
-    DataWriterStatus, DomainParticipant, DomainParticipantBuilder, DomainParticipantStatusEvent,
-    Key, Keyed, QosPolicies, QosPolicyBuilder, RepresentationIdentifier, StatusEvented, Topic,
-    TopicKind,
+    DataReaderStatus, DataWriterStatus, DomainParticipant, DomainParticipantBuilder,
+    DomainParticipantStatusEvent, Key, Keyed, QosPolicies, QosPolicyBuilder,
+    RepresentationIdentifier, StatusEvented, Topic, TopicKind,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use super::metrics::{MatchTable, PubMetrics, PubReport};
+use super::metrics::{MatchTable, PubMetrics, PubReport, SubMetrics};
 use super::{
     BackendEvent, BackendSample, DdsBackend, EndpointDto, ParticipantDto, TopicDto,
 };
@@ -183,7 +183,8 @@ fn handle_writer_status(matches: &MatchTable, metrics: &PubMetrics, event: DataW
 }
 
 /// Thin wrapper around a RustDDS DataReader exposing a sync
-/// `take_next_sample` API for the example subscriber binary.
+/// `take_next_sample` API for the example subscriber binary. Drains
+/// `DataReaderStatus::SampleLost` events into `metrics` on every poll.
 pub struct TypedSubscriber<T>
 where
     T: Keyed + DeserializeOwned + 'static,
@@ -193,6 +194,7 @@ where
     poll: Poll,
     events: Events,
     _topic: Topic,
+    metrics: Arc<SubMetrics>,
 }
 
 impl<T> TypedSubscriber<T>
@@ -204,6 +206,7 @@ where
     /// timeout. `Sample::Dispose` variants are surfaced as `Ok(None)` —
     /// callers that care about disposes should use the raw reader.
     pub fn take_next(&mut self, timeout: Duration) -> Result<Option<T>> {
+        self.drain_status();
         let _ = self.poll.poll(&mut self.events, Some(timeout))?;
         for _event in self.events.iter() {
             loop {
@@ -218,6 +221,23 @@ where
             }
         }
         Ok(None)
+    }
+
+    /// Drain reader status events. Currently records
+    /// `DataReaderStatus::SampleLost` into `metrics.lost_dds_local`.
+    pub fn drain_status(&self) {
+        while let Some(event) = self.reader.try_recv_status() {
+            if let DataReaderStatus::SampleLost { count } = event {
+                let n = count.count_change();
+                if n > 0 {
+                    self.metrics.record_sample_lost_dds(n as u64);
+                }
+            }
+        }
+    }
+
+    pub fn metrics(&self) -> &Arc<SubMetrics> {
+        &self.metrics
     }
 }
 
@@ -288,6 +308,7 @@ impl RustDdsBackend {
             poll,
             events: Events::with_capacity(8),
             _topic: topic,
+            metrics: SubMetrics::new(),
         })
     }
 }

@@ -6,6 +6,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -24,8 +25,8 @@ fn main() -> Result<()> {
 
     let (events_tx, _events_rx) = mpsc::channel();
     let backend = RustDdsBackend::start(DOMAIN_ID, events_tx)?;
-    let mut subscriber =
-        backend.create_typed_subscriber::<Chatter>(TOPIC_NAME, TYPE_NAME)?;
+    let mut subscriber = backend.create_typed_subscriber::<Chatter>(TOPIC_NAME, TYPE_NAME)?;
+    let metrics = subscriber.metrics().clone();
 
     println!(
         "[{} {}] subscriber listening on '{TOPIC_NAME}' on domain {DOMAIN_ID} (Ctrl-C to stop)",
@@ -33,14 +34,38 @@ fn main() -> Result<()> {
         RustDdsBackend::version(),
     );
 
+    // 1Hz heartbeat: stats line + a fresh ASCII sparkline (60s window
+    // at 1s resolution). Sub-second jitter doesn't matter — the
+    // sparkline buckets are coarse.
+    {
+        let metrics = metrics.clone();
+        let stop = stop.clone();
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_secs(1));
+                let snap = metrics.snapshot();
+                println!("[stats] {}", snap.format_line());
+                println!("{}", metrics.render_history());
+            }
+        });
+    }
+
     while !stop.load(Ordering::Relaxed) {
-        match subscriber.take_next(Duration::from_millis(500))? {
-            Some(c) => println!(
-                "recv pub={:08x} #{:<5} stamp={} text=\"{}\"",
-                c.publisher_id, c.counter, c.stamp_ns, c.text
-            ),
-            None => continue,
+        match subscriber.take_next(Duration::from_millis(500)) {
+            Ok(Some(c)) => metrics.on_sample(c.publisher_id, c.counter),
+            Ok(None) => continue,
+            // EINTR (Ctrl-C interrupting the poll) or any other reader
+            // error — log and break so the final report still prints.
+            Err(e) => {
+                eprintln!("[take_next ended] {e:?}");
+                break;
+            }
         }
     }
+
+    subscriber.drain_status();
+    let snap = metrics.snapshot();
+    println!("\n[final] {}", snap.to_json_pretty());
+    println!("\n[viz]\n{}", metrics.render_history());
     Ok(())
 }
