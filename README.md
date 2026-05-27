@@ -67,57 +67,158 @@ recompiling. `--help` on either lists everything; the most useful ones:
 | `--history-depth <N>` | both | KeepLast depth (default `100`) |
 | `--domain <id>` | both | DDS domain (default `0`) |
 | `--topic <name>` | both | topic name (default `Chatter`) |
-| `--csv <path>` | both | append a per-second row with cumulative counters and rate/percentile snapshots. Rows are skipped during `--await-readers`/`--warmup` so the file is steady-state only |
+| `--csv <path>` | both | append a per-second row. Counters (`sent`, `recv`, `lost_*`) are cumulative; rate and latency percentiles are computed over the last ~1 s window. Rows are skipped during `--await-readers`/`--warmup` so the file is steady-state only |
 
-A clean bench invocation. Start sub first so it's listening; pub will
-wait for it to match before writing:
+Pub and sub must agree on `--reliability` and `--domain` for matching.
+The `elapsed_s` field in `[stats]` / CSV / final JSON uses a monotonic
+`Instant`, so an NTP / DST jump to the wall clock during the run
+won't poison the rate calculation. The wire stamp (`stamp_ns` in the
+message) and `last_send_ns` in the JSON are still `SystemTime` nanos
+— those need to be comparable across processes.
+
+### Scenarios
+
+Each scenario is a self-contained bench setup that highlights one
+specific behavior. Always start the sub first (so the pub's
+`--await-readers` has someone to wait for), and load the resulting
+CSVs side-by-side in the explorer's **Bench** tab to read the
+verdict.
+
+#### 1. Healthy baseline
+
+Reference run. Establishes what a sane verdict looks like on your
+machine so the other scenarios have something to deviate from.
 
 ```bash
 # Terminal 1
-cargo run --release -p sub-rustdds -- --duration 30 --warmup 5
+cargo run --release -p sub-rustdds -- \
+    --warmup 5 --duration 30 --csv /tmp/sub.base.csv
 
 # Terminal 2
 cargo run --release -p pub-rustdds -- \
-    --rate 1000 --payload 1024 --duration 30 --warmup 5 --await-readers 1
+    --rate 1000 --payload 128 --warmup 5 --duration 30 \
+    --await-readers 1 --csv /tmp/pub.base.csv
 ```
 
-Pub and sub must agree on `--reliability` and `--domain` for matching.
-Without `--await-readers`, the pub's writer queue holds up to
-`--history-depth` samples for any future reader; when one matches,
-those buffered samples are delivered as a burst with stale `stamp_ns`,
-which inflates the latency histogram. `--await-readers` avoids that
-at the source.
+What to expect: pair verdict says **Run sain**, `loss_rate` is 0,
+`p99 < 2 ms`, and `delta` is in the low hundreds (tail samples sent
+after the sub stopped). If `p99` blows past 2 ms on a fresh boot,
+your machine just has background noise — make a note of the baseline
+and use *that* as the reference threshold.
 
-The `elapsed_s` field in `[stats]` / CSV / final JSON uses a
-monotonic `Instant`, so an NTP / DST jump to the wall clock during
-the run won't poison the rate calculation. The wire stamp (`stamp_ns`
-in the message) and `last_send_ns` in the JSON are still `SystemTime`
-nanos — those need to be comparable across processes.
+#### 2. Reliable vs Best-Effort under load
 
-### Multiple publishers / subscribers
+Same workload twice, only `--reliability` changes. Compares where
+each policy costs you: retransmit-blocking on Reliable vs silent
+drops on Best-Effort.
 
-The bench is single-binary but the sub already tracks per-publisher
-state keyed by the `publisher_id` field (which the pub sets to its
-PID). To stress with N pubs against one sub, just start them in
-parallel — each gets a unique `publisher_id`, and the sub's
-`streams[]` array in the final JSON lists per-pub `received` / `lost`
-/ counter ranges:
+```bash
+# Run A — Reliable
+cargo run --release -p sub-rustdds -- \
+    --reliability reliable --warmup 5 --duration 30 \
+    --csv /tmp/sub.reliable.csv
+cargo run --release -p pub-rustdds -- \
+    --reliability reliable --rate 5000 --payload 4096 \
+    --await-readers 1 --warmup 5 --duration 30 \
+    --csv /tmp/pub.reliable.csv
+
+# Run B — Best-Effort (same numbers, just swap reliability)
+cargo run --release -p sub-rustdds -- \
+    --reliability best-effort --warmup 5 --duration 30 \
+    --csv /tmp/sub.be.csv
+cargo run --release -p pub-rustdds -- \
+    --reliability best-effort --rate 5000 --payload 4096 \
+    --await-readers 1 --warmup 5 --duration 30 \
+    --csv /tmp/pub.be.csv
+```
+
+What to expect:
+- **Run A** stays at `lost_wire ≈ 0` but `write_max_us` spikes (the
+  writer parks waiting for acks under back-pressure — its
+  `max_blocking_time` is 100 ms).
+- **Run B** shows `lost_wire > 0` whenever the sub stalls, but
+  `write_avg_us` stays flat — the writer never blocks.
+
+Open both pair reports back-to-back to see the trade-off in one
+glance.
+
+#### 3. Why `--await-readers` matters
+
+Demonstrates the pre-match catch-up burst that contaminates latency
+when the pub starts before any sub is listening. The fix is in the
+flag name.
+
+```bash
+# Terminal 1 — pub goes first, no await, fat history
+cargo run --release -p pub-rustdds -- \
+    --rate 1000 --duration 30 --history-depth 5000 \
+    --csv /tmp/pub.burst.csv
+
+# Wait ~5 s, THEN terminal 2 (warmup=0 so we keep the burst)
+cargo run --release -p sub-rustdds -- \
+    --warmup 0 --duration 25 --csv /tmp/sub.burst.csv
+```
+
+What to expect on the sub side: the first 1–2 CSV rows show
+`rate_per_s` far above 1000 (catch-up flood of buffered samples)
+and `lat_max_us` in the hundreds of milliseconds — those samples
+carry a `stamp_ns` from before the sub existed.
+
+Now rerun with `--await-readers 1` on the pub *and* `--warmup 5` on
+the sub: the burst is gone and the verdict goes back to Ok.
+
+#### 4. Multi-publisher fan-in
+
+Four pubs at 250 Hz each, one sub. Verifies that `Chatter.publisher_id`
+correctly partitions per-stream state on the sub.
 
 ```bash
 # Terminal 1
-cargo run --release -p sub-rustdds -- --duration 30 --warmup 5
+cargo run --release -p sub-rustdds -- \
+    --warmup 5 --duration 30 --csv /tmp/sub.fanin.csv
 
 # Terminal 2
 for _ in 1 2 3 4; do
     cargo run --release -p pub-rustdds -- \
-        --rate 250 --duration 30 --await-readers 1 &
+        --rate 250 --duration 30 --warmup 5 --await-readers 1 &
 done
 wait
 ```
 
-Multiple subs work the same way (each gets its own copy of every
-sample). Use `--csv` on each process to capture independent
-time-series.
+What to expect:
+- Sub aggregate `rate_per_s ≈ 1000`.
+- Final JSON's `streams[]` lists 4 entries with ~6250 received each
+  and distinct `publisher_id` values.
+- If one of the pubs restarts mid-run, the sub's rebaseline logic
+  (`counter < first_counter_seen` → reset) keeps `lost_wire` from
+  spuriously jumping by a million.
+
+Pair analysis isn't meaningful here (it expects a single pub CSV);
+read each side's report independently.
+
+#### 5. Heavy payload
+
+Pushes the payload toward the UDP single-datagram limit (~64 KiB) to
+show where serialization and fragmentation start dominating write
+latency.
+
+```bash
+# Terminal 1
+cargo run --release -p sub-rustdds -- \
+    --warmup 5 --duration 30 --csv /tmp/sub.fat.csv
+
+# Terminal 2
+cargo run --release -p pub-rustdds -- \
+    --rate 500 --payload 65000 --warmup 5 --duration 30 \
+    --await-readers 1 --csv /tmp/pub.fat.csv
+```
+
+What to expect: `write_avg_us` an order of magnitude higher than
+Scenario 1's 128-byte baseline, per-window `lat_p99_us` noisier, and
+on Reliable, occasional `write_max_us` spikes when the writer waits
+for fragment acks. Push to 1 MiB and you'll see Reliable trigger
+visible retransmit pauses; switch to Best-Effort at that size and
+loss appears instead.
 
 ### Reading the bench output
 
