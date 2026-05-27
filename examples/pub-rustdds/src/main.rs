@@ -179,6 +179,12 @@ fn main() -> Result<()> {
                 writeln!(w, "t_s,sent,errors,rate_per_s,write_avg_us,write_max_us").unwrap();
                 w
             });
+            // Track the previous tick's cumulative values so each CSV row
+            // can carry the per-window rate / write time instead of a
+            // cumulative average that converges to the run mean.
+            let mut prev_sent: u64 = 0;
+            let mut prev_elapsed_s: f64 = 0.0;
+            let mut prev_write_ns_total: u64 = 0;
             while !stop.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_secs(1));
                 print_match_events(&matches, &metrics);
@@ -186,17 +192,38 @@ fn main() -> Result<()> {
                 println!("[stats] {}", snap.format_line());
                 if measuring.load(Ordering::Relaxed) {
                     if let Some(w) = csv.as_mut() {
+                        // A reset (await_readers or warmup) is detected by
+                        // elapsed_s walking backwards; rebase the window.
+                        if snap.elapsed_s < prev_elapsed_s {
+                            prev_sent = 0;
+                            prev_elapsed_s = 0.0;
+                            prev_write_ns_total = 0;
+                        }
+                        let dt = (snap.elapsed_s - prev_elapsed_s).max(1e-9);
+                        let dsent = snap.sent.saturating_sub(prev_sent);
+                        let inst_rate = dsent as f64 / dt;
+                        let dwrite_ns =
+                            snap.write_ns_total.saturating_sub(prev_write_ns_total);
+                        let inst_write_avg_us = if dsent > 0 {
+                            dwrite_ns / dsent / 1_000
+                        } else {
+                            0
+                        };
+                        let inst_write_max_us = metrics.take_write_ns_max() / 1_000;
                         let _ = writeln!(
                             w,
                             "{:.3},{},{},{:.3},{},{}",
                             snap.elapsed_s,
                             snap.sent,
                             snap.errors,
-                            snap.rate_per_s,
-                            snap.write_ns_avg / 1_000,
-                            snap.write_ns_max / 1_000,
+                            inst_rate,
+                            inst_write_avg_us,
+                            inst_write_max_us,
                         );
                         let _ = w.flush();
+                        prev_sent = snap.sent;
+                        prev_elapsed_s = snap.elapsed_s;
+                        prev_write_ns_total = snap.write_ns_total;
                     }
                 }
             }

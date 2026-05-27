@@ -143,6 +143,11 @@ fn main() -> Result<()> {
                 .unwrap();
                 w
             });
+            // Per-window deltas so the CSV row's rate / latency stats
+            // reflect the last ~1s, not the cumulative-since-reset
+            // average that just converges as the run goes on.
+            let mut prev_received: u64 = 0;
+            let mut prev_elapsed_s: f64 = 0.0;
             while !stop.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_secs(1));
                 let snap = metrics.snapshot();
@@ -150,7 +155,16 @@ fn main() -> Result<()> {
                 println!("{}", metrics.render_history());
                 if measuring.load(Ordering::Relaxed) {
                     if let Some(w) = csv.as_mut() {
-                        let lat = &snap.latency;
+                        // Warmup reset walks elapsed_s back to ~0 — rebase
+                        // the window so the next row's delta is honest.
+                        if snap.elapsed_s < prev_elapsed_s {
+                            prev_received = 0;
+                            prev_elapsed_s = 0.0;
+                        }
+                        let dt = (snap.elapsed_s - prev_elapsed_s).max(1e-9);
+                        let drecv = snap.received.saturating_sub(prev_received);
+                        let inst_rate = drecv as f64 / dt;
+                        let lat = metrics.take_latency_window();
                         let _ = writeln!(
                             w,
                             "{:.3},{},{},{},{},{},{},{:.3},{},{},{},{}",
@@ -161,13 +175,15 @@ fn main() -> Result<()> {
                             snap.reordered,
                             snap.duplicates,
                             snap.clock_skew_skipped,
-                            snap.rate_per_s,
+                            inst_rate,
                             lat.p50_ns / 1_000,
                             lat.p95_ns / 1_000,
                             lat.p99_ns / 1_000,
                             lat.max_ns / 1_000,
                         );
                         let _ = w.flush();
+                        prev_received = snap.received;
+                        prev_elapsed_s = snap.elapsed_s;
                     }
                 }
             }
@@ -176,9 +192,13 @@ fn main() -> Result<()> {
 
     let stop_at = (cli.duration > 0).then(|| Instant::now() + Duration::from_secs(cli.duration));
     // Warmup is armed by the first received sample, not by process
-    // start — see the doc on `Cli::warmup`.
-    let mut warmup_until: Option<Instant> = None;
+    // start — see the doc on `Cli::warmup`. We gate against the
+    // sample's own `recv_ns` (same SystemTime clock the deadline is
+    // built from) so a batch crossing the boundary is split correctly
+    // even if the iteration loop straddles the moment.
+    let mut warmup_until_ns: Option<u64> = None;
     let mut warmed_up = cli.warmup == 0;
+    let warmup_ns = cli.warmup.saturating_mul(1_000_000_000);
 
     while !stop.load(Ordering::Relaxed) {
         if matches!(stop_at, Some(d) if Instant::now() >= d) {
@@ -188,14 +208,14 @@ fn main() -> Result<()> {
             Ok(batch) => {
                 for (c, recv_ns) in batch {
                     if !warmed_up {
-                        let deadline = *warmup_until.get_or_insert_with(|| {
+                        let deadline_ns = *warmup_until_ns.get_or_insert_with(|| {
                             eprintln!(
                                 "[discovery] first sample received — starting {} s warmup",
                                 cli.warmup,
                             );
-                            Instant::now() + Duration::from_secs(cli.warmup)
+                            recv_ns.saturating_add(warmup_ns)
                         });
-                        if Instant::now() < deadline {
+                        if recv_ns < deadline_ns {
                             continue; // drop in-warmup samples (incl. catch-up burst)
                         }
                         // Crossed the warmup boundary — wipe any state

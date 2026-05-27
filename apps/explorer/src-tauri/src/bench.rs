@@ -165,6 +165,17 @@ pub fn parse_bench_pair_str(pub_csv: &str, sub_csv: &str) -> Result<PairReport> 
     if sub_report.kind != BenchKind::Sub {
         bail!("second argument must be a sub CSV (got kind={:?})", sub_report.kind);
     }
+    // Sanity-check the two CSVs really come from the same run.
+    // Mismatched topic / domain / reliability almost always means the
+    // user paired files from different runs; without this guard the
+    // pair analysis would silently produce nonsense deltas.
+    let mismatches = pair_config_mismatches(&pub_report.config, &sub_report.config);
+    if !mismatches.is_empty() {
+        bail!(
+            "pub/sub CSVs disagree on {} — probably from different runs",
+            mismatches.join(", ")
+        );
+    }
     let analysis = analyze_pair(&pub_report, &sub_report);
     let verdict = pair_verdict(&pub_report, &sub_report, &analysis);
     Ok(PairReport {
@@ -577,14 +588,18 @@ fn analyze_pair(pub_r: &BenchReport, sub_r: &BenchReport) -> PairAnalysis {
         0.0
     };
 
-    // The sub silently discards samples during its warmup window —
-    // that's `sub_warmup_s * pub_rate` samples that pub *sent* but sub
-    // never counted. We surface this so the user can see if their
-    // delta is "expected warmup" vs "real loss".
-    let expected_warmup_discard = sub_r
-        .config
-        .warmup
-        .map(|w| (w as f64 * pub_rate).round() as u64);
+    // Both sides skip samples during their own warmup window before
+    // resetting their counters. Since `await_readers` aligns the start
+    // times within milliseconds, the expected delta is dominated by the
+    // *difference* in warmup lengths: when sub_warmup > pub_warmup, pub
+    // counts samples that sub still drops, and the delta is positive.
+    // When pub_warmup > sub_warmup, it goes the other way and delta can
+    // legitimately be negative.
+    let expected_warmup_discard = sub_r.config.warmup.map(|sw| {
+        let pw = pub_r.config.warmup.unwrap_or(0);
+        let net = sw.saturating_sub(pw);
+        (net as f64 * pub_rate).round() as u64
+    });
 
     PairAnalysis {
         pub_sent,
@@ -596,6 +611,25 @@ fn analyze_pair(pub_r: &BenchReport, sub_r: &BenchReport) -> PairAnalysis {
         sub_rate,
         rate_diff_pct,
     }
+}
+
+/// List the config fields where pub and sub disagree. Used to refuse
+/// pairing CSVs from clearly different runs.
+fn pair_config_mismatches(p: &BenchConfig, s: &BenchConfig) -> Vec<String> {
+    let mut out = Vec::new();
+    if p.topic != s.topic {
+        out.push(format!("topic ({:?} vs {:?})", p.topic, s.topic));
+    }
+    if p.domain != s.domain {
+        out.push(format!("domain ({:?} vs {:?})", p.domain, s.domain));
+    }
+    if p.reliability != s.reliability {
+        out.push(format!(
+            "reliability ({:?} vs {:?})",
+            p.reliability, s.reliability
+        ));
+    }
+    out
 }
 
 fn pair_verdict(
@@ -648,61 +682,59 @@ fn pair_verdict(
         explain: rate_explain,
     });
 
-    // Delta sanity — compare `delta` to `expected_warmup_discard`.
-    // If delta is way bigger, samples got lost somewhere we can't
-    // explain. If delta is negative, sub somehow counted more than pub
-    // sent (shouldn't happen).
-    let (delta_sev, delta_explain) = if a.delta < 0 {
-        (
-            Severity::Bad,
-            format!(
-                "Delta négatif ({}). Le sub a comptabilisé plus de samples que le pub n'en a \
-                 envoyé — incohérence, vérifie que les deux CSV viennent bien du même run.",
-                a.delta
-            ),
-        )
-    } else if let Some(expected) = a.expected_warmup_discard {
-        let high = (expected as f64 * 1.5).max(50.0) as i64;
-        let very_high = (expected as f64 * 3.0).max(200.0) as i64;
-        if a.delta <= high {
-            (
-                Severity::Ok,
-                format!(
-                    "Delta de {} samples — cohérent avec la fenêtre de warmup du sub \
-                     (~{} samples discardés silencieusement) et le tail après que le sub se \
-                     soit arrêté.",
-                    a.delta, expected,
-                ),
-            )
-        } else if a.delta <= very_high {
-            (
-                Severity::Warn,
-                format!(
-                    "Delta de {} samples, plus que l'estimé de ~{} pour la fenêtre de warmup. \
-                     Le pub a peut-être continué à émettre longtemps après l'arrêt du sub, \
-                     ou il y a eu de la contention.",
-                    a.delta, expected,
-                ),
-            )
-        } else {
-            (
-                Severity::Bad,
-                format!(
-                    "Delta de {} samples, beaucoup plus que l'estimé de ~{} pour le warmup. \
-                     Il manque probablement des samples côté sub — vérifie la durée des deux \
-                     runs et les pertes individuelles.",
-                    a.delta, expected,
-                ),
-            )
+    // Delta sanity — compare `delta` to the signed expected value
+    // derived from the *difference* between pub and sub warmups. If
+    // pub_warmup > sub_warmup the expected delta is negative (sub
+    // counted more than pub before its own reset) and a negative
+    // observed delta is fine, not a bug.
+    let pub_warmup = pub_r.config.warmup;
+    let sub_warmup = sub_r.config.warmup;
+    let expected_signed: i64 = match (pub_warmup, sub_warmup) {
+        (Some(pw), Some(sw)) => {
+            ((sw as i64 - pw as i64) as f64 * a.pub_rate).round() as i64
         }
-    } else {
+        _ => 0,
+    };
+    let dev = (a.delta - expected_signed).abs();
+    let scale = expected_signed.unsigned_abs() as f64;
+    // Symmetric tolerance around `expected_signed`, with absolute floors
+    // for the case where the expected delta is ~0 (tail + scheduling
+    // jitter still produce a few hundred samples of slack).
+    let tol_ok = (scale * 0.5).round() as i64 + 100;
+    let tol_warn = (scale * 2.0).round() as i64 + 500;
+    let warmup_desc = match (pub_warmup, sub_warmup) {
+        (Some(pw), Some(sw)) => format!("pub warmup {}s, sub warmup {}s", pw, sw),
+        (Some(pw), None) => format!("pub warmup {}s, sub warmup inconnu", pw),
+        (None, Some(sw)) => format!("pub warmup inconnu, sub warmup {}s", sw),
+        (None, None) => "warmups inconnus".to_string(),
+    };
+    let (delta_sev, delta_explain) = if dev <= tol_ok {
         (
             Severity::Ok,
             format!(
-                "Delta de {} samples. Pas de warmup côté sub donc impossible d'estimer le \
-                 discard attendu — le delta couvre principalement le tail (samples envoyés \
-                 après l'arrêt du sub).",
-                a.delta
+                "Delta de {} samples — cohérent avec l'attendu ~{} ({}). \
+                 L'écart résiduel couvre le tail et la gigue d'ordonnancement.",
+                a.delta, expected_signed, warmup_desc,
+            ),
+        )
+    } else if dev <= tol_warn {
+        (
+            Severity::Warn,
+            format!(
+                "Delta de {} samples (attendu ~{}, écart {}). Le pub a peut-être \
+                 continué à émettre longtemps après l'arrêt du sub, ou il y a eu de la \
+                 contention. {}.",
+                a.delta, expected_signed, dev, warmup_desc,
+            ),
+        )
+    } else {
+        (
+            Severity::Bad,
+            format!(
+                "Delta de {} samples (attendu ~{}, écart {}). Les deux CSV \
+                 semblent provenir de runs différents, ou il manque vraiment des samples \
+                 côté sub. {}.",
+                a.delta, expected_signed, dev, warmup_desc,
             ),
         )
     };

@@ -44,14 +44,26 @@ impl PubMetrics {
     /// Zero every counter and re-stamp the start time. Used at the
     /// warmup boundary so steady-state numbers aren't polluted by
     /// discovery / cold-cache effects.
+    ///
+    /// All counters are zeroed under the `started_at` mutex so a
+    /// concurrent `snapshot()` observes either the pre-reset state or
+    /// the post-reset state — never a torn mix.
     pub fn reset(&self) {
-        self.started_ns.store(now_ns(), Ordering::Relaxed);
-        *self.started_at.lock().unwrap() = Instant::now();
+        let mut g = self.started_at.lock().unwrap();
         self.sent.store(0, Ordering::Relaxed);
         self.errors.store(0, Ordering::Relaxed);
         self.last_send_ns.store(0, Ordering::Relaxed);
         self.write_ns_total.store(0, Ordering::Relaxed);
         self.write_ns_max.store(0, Ordering::Relaxed);
+        *g = Instant::now();
+        self.started_ns.store(now_ns(), Ordering::Relaxed);
+    }
+
+    /// Swap the running max with 0 and return the previous value. Used
+    /// by the bench heartbeat to read a per-window max (as opposed to
+    /// the cumulative max that would dominate the rest of the run).
+    pub fn take_write_ns_max(&self) -> u64 {
+        self.write_ns_max.swap(0, Ordering::Relaxed)
     }
 
     /// Record a successful `write()` call along with how long it took
@@ -75,25 +87,36 @@ impl PubMetrics {
 
     pub fn snapshot(&self) -> PubMetricsSnapshot {
         let now = now_ns();
+        let g = self.started_at.lock().unwrap();
         let started = self.started_ns.load(Ordering::Relaxed);
-        let elapsed_s = self.started_at.lock().unwrap().elapsed().as_secs_f64();
+        let elapsed_s = g.elapsed().as_secs_f64();
         let sent = self.sent.load(Ordering::Relaxed);
         let total_ns = self.write_ns_total.load(Ordering::Relaxed);
+        let max_ns = self.write_ns_max.load(Ordering::Relaxed);
+        let errors = self.errors.load(Ordering::Relaxed);
+        let last_send_ns = self.last_send_ns.load(Ordering::Relaxed);
+        drop(g);
         PubMetricsSnapshot {
             started_ns: started,
             now_ns: now,
             elapsed_s,
             sent,
-            errors: self.errors.load(Ordering::Relaxed),
-            last_send_ns: self.last_send_ns.load(Ordering::Relaxed),
+            errors,
+            last_send_ns,
             rate_per_s: if elapsed_s > 0.0 { sent as f64 / elapsed_s } else { 0.0 },
             write_ns_avg: if sent > 0 { total_ns / sent } else { 0 },
-            write_ns_max: self.write_ns_max.load(Ordering::Relaxed),
+            write_ns_total: total_ns,
+            write_ns_max: max_ns,
         }
     }
 }
 
 /// JSON-serializable view of `PubMetrics` at one instant.
+///
+/// `rate_per_s`, `write_ns_avg`, and `write_ns_max` are all cumulative
+/// since the last `reset()`. For per-window stats, callers compute
+/// deltas from successive snapshots using `sent` and `write_ns_total`,
+/// and read a per-window max with `PubMetrics::take_write_ns_max`.
 #[derive(Serialize, Clone, Debug)]
 pub struct PubMetricsSnapshot {
     pub started_ns: u64,
@@ -104,6 +127,10 @@ pub struct PubMetricsSnapshot {
     pub last_send_ns: u64,
     pub rate_per_s: f64,
     pub write_ns_avg: u64,
+    /// Total nanoseconds spent in `writer.write()` since the last
+    /// reset. Heartbeats diff this between ticks to get per-window
+    /// write latency.
+    pub write_ns_total: u64,
     pub write_ns_max: u64,
 }
 
@@ -493,7 +520,14 @@ pub struct SubMetrics {
     clock_skew_skipped: AtomicU64,
     streams: Mutex<HashMap<u32, StreamState>>,
     history: Mutex<SubHistory>,
+    /// Cumulative latency since the last `reset()`. Used by the live
+    /// stdout heartbeat and the final JSON dump at exit.
     latency: LatencyHisto,
+    /// Per-tick latency window. Both `latency` and `latency_window`
+    /// receive each sample; the bench heartbeat snapshots+resets this
+    /// one every second so each CSV row reflects a real 1-second
+    /// window instead of a cumulative average.
+    latency_window: LatencyHisto,
 }
 
 struct SubHistory {
@@ -531,15 +565,19 @@ impl SubMetrics {
                 lat_us: TimeBuckets::new(),
             }),
             latency: LatencyHisto::new(),
+            latency_window: LatencyHisto::new(),
         })
     }
 
     /// Zero every counter, drop per-publisher state, clear the
-    /// sparkline buffers and the latency histogram, and re-stamp the
+    /// sparkline buffers and the latency histograms, and re-stamp the
     /// start time. Used at the warmup boundary.
+    ///
+    /// Counters are zeroed under the `started_at` mutex so a
+    /// concurrent `snapshot()` observes either the pre-reset state or
+    /// the post-reset state — never a torn mix.
     pub fn reset(&self) {
-        self.started_ns.store(now_ns(), Ordering::Relaxed);
-        *self.started_at.lock().unwrap() = Instant::now();
+        let mut g = self.started_at.lock().unwrap();
         self.received.store(0, Ordering::Relaxed);
         self.lost_wire.store(0, Ordering::Relaxed);
         self.reordered.store(0, Ordering::Relaxed);
@@ -551,7 +589,20 @@ impl SubMetrics {
         h.recv.reset();
         h.lost.reset();
         h.lat_us.reset();
+        drop(h);
         self.latency.reset();
+        self.latency_window.reset();
+        *g = Instant::now();
+        self.started_ns.store(now_ns(), Ordering::Relaxed);
+    }
+
+    /// Snapshot the per-window latency histogram and zero it. Called
+    /// once per CSV tick so each row reflects the latency distribution
+    /// over the past ~1 second instead of since reset.
+    pub fn take_latency_window(&self) -> LatencySnapshot {
+        let snap = self.latency_window.snapshot();
+        self.latency_window.reset();
+        snap
     }
 
     /// Record one received sample. `publisher_id` and `counter` come
@@ -632,15 +683,18 @@ impl SubMetrics {
         }
         let ns = recv_ns - stamp_ns;
         self.latency.record(ns);
+        self.latency_window.record(ns);
         let mut h = self.history.lock().unwrap();
         h.advance_to(now_s());
         h.lat_us.add_max(ns / 1_000);
     }
 
     pub fn snapshot(&self) -> SubMetricsSnapshot {
-        let elapsed_s = self.started_at.lock().unwrap().elapsed().as_secs_f64();
+        let g = self.started_at.lock().unwrap();
+        let elapsed_s = g.elapsed().as_secs_f64();
         let received = self.received.load(Ordering::Relaxed);
         let lost_wire = self.lost_wire.load(Ordering::Relaxed);
+        drop(g);
         let denom = received + lost_wire;
         let streams = self
             .streams
